@@ -131,7 +131,18 @@ class DatabaseManager:
         finally:
             await conn.close()
 
+
+# Сопоставление похожих кириллических символов с латиницей
+CYR_TO_LAT = {
+    'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H',
+    'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
+    'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'т': 't',
+    'у': 'y', 'х': 'x', 'В': 'B', 'д': 'd', 'Д': 'D', 'Н': 'H'
+}
 class TextProcessor:
+
+
+    
     @staticmethod
     def fix_markdown(text: str) -> str:
         special_chars = r"_*[]()~`>#+-=|{}.!"
@@ -151,6 +162,7 @@ class TextProcessor:
         text = re.sub(r"\[(.*?)\]\((.*?)\)", escape_markdown_links, text)
         # text = re.sub(r"\[(.*?)\]\((.*?)\)", lambda m: f"[{m.group(1)}]\\({m.group(2).replace(')', '\\)')}\\)", text)
         return text
+        
 
     @staticmethod
     def normalize_text(text):
@@ -167,6 +179,25 @@ class TextProcessor:
         if not isinstance(text, str):
             return 0
         return len(re.findall(r'[^a-zA-Zа-яА-ЯёЁ\s.,!?0-9]', text))
+    @staticmethod
+    def normalize_text_cyr(text):
+        # Заменить кириллицу на похожие латинские символы
+        normalized = ''.join(CYR_TO_LAT.get(char, char) for char in text)
+        return normalized
+    @staticmethod
+    def contains_usdt_or_usdc(text):
+        # Нормализуем текст: заменим кириллицу -> латиницу
+        normalized = TextProcessor.normalize_text_cyr(text)
+
+        # Удалим все разделители между буквами
+        compacted = re.sub(r'[\s.\-_]', '', normalized)
+
+        # Приводим к верхнему регистру
+        compacted = compacted.upper()
+
+        # Ищем целевые строки
+        return 'USDT' in compacted or 'USDC' in compacted
+
 class SpamDetector:
     def __init__(self):
         self.vectorizer = None
@@ -236,7 +267,7 @@ class UserManager:
                 if isinstance(join_time, datetime):
                      # Убедимся, что время в UTC
                     join_time_utc = join_time.astimezone(timezone.utc)
-                    if (now - join_time_utc).total_seconds() > 86400: # 24 часа
+                    if (now - join_time_utc).total_seconds() > 172800: # 48 часа
                         user_ids_to_remove.append(user_id)
                 else:
                     logging.warning(f"Некорректное время join_time у user_id {user_id}, пользователь будет удален.")
@@ -596,6 +627,31 @@ class TelegramBot:
 
             return
 
+        usdt_usdc=TextProcessor.contains_usdt_or_usdc(text)
+        if usdt_usdc:
+            msg_to_master_lines = [
+                f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
+                f"ID: {sender_id}",
+                f"Имя: {user_data.get('username', 'N/A')}",
+                f"Хэндл: {user_data.get('user_handle', 'N/A')}",
+                f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
+                f"USDT/ USDC"
+            ]
+            await message.delete()
+            permissions = types.ChatPermissions(can_send_messages=False)
+            await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
+            logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: usdt usdc")
+            # Обновляем статус в менеджере ПОСЛЕ успешного ограничения
+            await self.user_manager.update_user_status(sender_id, "restricted")
+
+            final_msg_to_master = "\n".join(msg_to_master_lines)
+            # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
+            formatted_report = TextProcessor.fix_markdown(final_msg_to_master)
+            await self.bot.send_message(self.master_id, formatted_report, parse_mode="Markdown")
+
+            return
+
+        
         # !!! Исправленная проверка на повторение !!!
         text_repeated = False
         min_repetition_count = 3  # Порог срабатывания
