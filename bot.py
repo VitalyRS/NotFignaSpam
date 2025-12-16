@@ -247,6 +247,14 @@ class UserManager:
                 self.new_users[user_id]['text'].append(text)
                 self.new_users[user_id]['text_id'].append(text_id)
 
+    async def increment_clean_messages(self, user_id) -> int:
+        """Увеличивает счётчик чистых сообщений. Возвращает новое значение."""
+        async with self.new_users_lock:
+            if user_id in self.new_users:
+                self.new_users[user_id]['clean_messages'] = self.new_users[user_id].get('clean_messages', 0) + 1
+                return self.new_users[user_id]['clean_messages']
+            return 0
+
     async def add_bad_nickname(self, nickname):
         if nickname not in self.bad_nicknames:
             self.bad_nicknames.append(nickname)
@@ -509,7 +517,8 @@ class TelegramBot:
                     'notified': False,
                     'status': new_status,
                     'text': [],
-                    'text_id': []
+                    'text_id': [],
+                    'clean_messages': 0  # Счётчик чистых сообщений для раннего выхода из карантина
                 })
                 logging.info(f"Новый участник {username} ({user_id}) добавлен в список отслеживания.")
                 try:
@@ -744,6 +753,44 @@ class TelegramBot:
 
         # Сохраняем текст в историю для проверки повторов в будущем
         await self.user_manager.update_user_text(sender_id, text, message.message_id)
+
+        # Увеличиваем счётчик чистых сообщений и проверяем на автопромоут
+        clean_count = await self.user_manager.increment_clean_messages(sender_id)
+        
+        # Если пользователь отправил 2 чистых сообщения — даём полные права
+        if clean_count >= 2:
+            try:
+                # Восстанавливаем полные права
+                full_permissions = types.ChatPermissions(
+                    can_send_messages=True,
+                    can_send_audios=True,
+                    can_send_documents=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_video_notes=True,
+                    can_send_voice_notes=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                    can_invite_users=True
+                )
+                await self.bot.restrict_chat_member(chat_id, sender_id, permissions=full_permissions)
+                
+                # Удаляем из отслеживания
+                await self.user_manager.remove_user(sender_id)
+                
+                logging.info(f"Пользователь {sender_id} ({user_data.get('username')}) прошёл проверку (2 чистых сообщения). Полные права восстановлены.")
+                
+                await self.bot.send_message(
+                    self.master_id,
+                    f"✅ Пользователь прошёл проверку:\n"
+                    f"ID: {sender_id}\n"
+                    f"Имя: {user_data.get('username', 'N/A')}\n"
+                    f"Хэндл: {user_data.get('user_handle', 'N/A')}\n"
+                    f"Полные права восстановлены после 2 чистых сообщений."
+                )
+            except Exception as e:
+                logging.error(f"Ошибка при восстановлении прав пользователю {sender_id}: {e}", exc_info=True)
 
 
     async def handle_media(self, message: types.Message):
