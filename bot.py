@@ -329,10 +329,12 @@ class TelegramBot:
         self._register_handlers()
 
     def _register_handlers(self):
+        self.router.message(Command(commands=['help']))(self.show_help)
         self.router.message(Command(commands=['suka']))(self.add_nickname)
         self.router.message(Command(commands=['list']))(self.show_nicknames)
         self.router.message(Command(commands=['strange']))(self.show_strange)
         self.router.message(Command(commands=['restrict']))(self.restrict)
+        self.router.message(Command(commands=['addc']))(self.add_to_clean)
         self.router.chat_member()(self.handle_chat_member)
         self.router.message(F.text)(self.handle_message)
         self.router.message(F.photo | F.video | F.audio | F.document |
@@ -341,6 +343,93 @@ class TelegramBot:
 
         self.dp.startup.register(self.on_startup)
         self.dp.shutdown.register(self.on_shutdown)
+
+    async def show_help(self, message: types.Message):
+        """Показывает список доступных команд"""
+        if message.from_user.id != self.master_id:
+            return
+
+        help_text = """
+🤖 *Команды бота Anti-Spam:*
+
+📋 *Управление карантином:*
+• `/strange` — показать новых пользователей на карантине
+• `/addc <user_id>` — убрать пользователя из карантина и дать полные права
+• `/restrict <id1,id2,...>` — ограничить права пользователям
+
+🚫 *Чёрные списки:*
+• `/suka <никнейм>` — добавить никнейм в чёрный список
+• `/list` — показать список запрещённых никнеймов
+
+ℹ️ `/help` — показать это сообщение
+
+⚙️ *Автоматические проверки:*
+• Карантин 7 дней для новых пользователей
+• Бан при плохом никнейме/имени
+• Удаление медиа от новых пользователей
+• Блокировка при 3 одинаковых сообщениях
+• Проверка на спам (ML модель)
+• Автопромоут после 2 чистых сообщений
+"""
+        await message.reply(help_text, parse_mode="Markdown")
+
+    async def add_to_clean(self, message: types.Message):
+        """Принудительно убирает пользователя из карантина и даёт полные права"""
+        if message.from_user.id != self.master_id:
+            return
+
+        command_parts = message.text.split(maxsplit=1)
+        if len(command_parts) < 2 or not command_parts[1]:
+            await message.reply("❌ Укажите ID пользователя: `/addc 123456789`", parse_mode="Markdown")
+            return
+
+        try:
+            user_id = int(command_parts[1].strip())
+        except ValueError:
+            await message.reply("❌ ID должен быть числом")
+            return
+
+        # Проверяем, есть ли пользователь в карантине
+        user_data = None
+        async with self.user_manager.new_users_lock:
+            user_data = self.user_manager.new_users.get(user_id)
+
+        if not user_data:
+            await message.reply(f"⚠️ Пользователь `{user_id}` не найден в списке карантина.", parse_mode="Markdown")
+            return
+
+        try:
+            # Восстанавливаем полные права
+            full_permissions = types.ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_invite_users=True
+            )
+            await self.bot.restrict_chat_member(self.target_chat_id, user_id, permissions=full_permissions)
+            
+            # Удаляем из отслеживания
+            await self.user_manager.remove_user(user_id)
+            
+            logging.info(f"Админ {message.from_user.id} вручную удалил пользователя {user_id} из карантина.")
+            
+            await message.reply(
+                f"✅ Пользователь удалён из карантина:\n"
+                f"ID: `{user_id}`\n"
+                f"Имя: {user_data.get('username', 'N/A')}\n"
+                f"Полные права восстановлены.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при удалении пользователя {user_id} из карантина: {e}", exc_info=True)
+            await message.reply(f"❌ Ошибка: {e}")
 
     async def add_nickname(self, message: types.Message):
         if message.from_user.id != self.master_id:
