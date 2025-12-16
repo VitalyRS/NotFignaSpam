@@ -106,7 +106,7 @@ class DatabaseManager:
         finally:
             await conn.close()
 
-    async def save_bad_words(self, bad_words):
+    async def save_bad_words(self, bad_words: list):
         """
         Сохраняет список плохих слов в БД
         :param bad_words: список запрещённых слов
@@ -119,7 +119,7 @@ class DatabaseManager:
         finally:
             await conn.close()
 
-    async def load_bad_words(self) :
+    async def load_bad_words(self) -> list:
         """
         Загружает список плохих слов из БД
         :return: список запрещённых слов
@@ -137,7 +137,7 @@ CYR_TO_LAT = {
     'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H',
     'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
     'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'т': 't',
-    'у': 'y', 'х': 'x', 'В': 'B', 'д': 'd', 'Д': 'D', 'Н': 'H'
+    'у': 'y', 'х': 'x', 'д': 'd', 'Д': 'D', 'в': 'b', 'н': 'h'
 }
 class TextProcessor:
 
@@ -256,6 +256,9 @@ class UserManager:
     async def get_bad_nicknames(self):
         return self.bad_nicknames
 
+    # Карантин для новых пользователей: 7 дней (в секундах)
+    QUARANTINE_SECONDS = 7 * 24 * 60 * 60  # 604800 секунд = 7 дней
+
     async def clean_old_users(self):
         now = datetime.now(timezone.utc)
         removed_count = 0
@@ -267,7 +270,7 @@ class UserManager:
                 if isinstance(join_time, datetime):
                      # Убедимся, что время в UTC
                     join_time_utc = join_time.astimezone(timezone.utc)
-                    if (now - join_time_utc).total_seconds() > 172800: # 48 часа
+                    if (now - join_time_utc).total_seconds() > self.QUARANTINE_SECONDS:  # 7 дней
                         user_ids_to_remove.append(user_id)
                 else:
                     logging.warning(f"Некорректное время join_time у user_id {user_id}, пользователь будет удален.")
@@ -417,7 +420,12 @@ class TelegramBot:
                     user_id=user_id,
                     permissions=types.ChatPermissions(
                         can_send_messages=False,
-                        can_send_media_messages=False,
+                        can_send_audios=False,
+                        can_send_documents=False,
+                        can_send_photos=False,
+                        can_send_videos=False,
+                        can_send_video_notes=False,
+                        can_send_voice_notes=False,
                         can_send_polls=False,
                         can_send_other_messages=False,
                         can_add_web_page_previews=False,
@@ -466,10 +474,9 @@ class TelegramBot:
             return
 
 
-        # async with self.user_manager.new_users_lock:
-        #     users_data=self.user_manager.new_users
-        # print(self.user_manager.new_users)
-        users_with_text=self.format_users_message(self.user_manager.new_users)
+        async with self.user_manager.new_users_lock:
+            users_data = self.user_manager.new_users.copy()
+        users_with_text = self.format_users_message(users_data)
 
         # print(users_with_text)
         await self.bot.send_message(
@@ -611,12 +618,12 @@ class TelegramBot:
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
                 f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
-                f"No cyrrilic count"
+                f"Non-latin/cyrillic symbols detected"
             ]
             await message.delete()
             permissions = types.ChatPermissions(can_send_messages=False)
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
-            logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: no cirylic")
+            logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: non-latin/cyrillic symbols")
             # Обновляем статус в менеджере ПОСЛЕ успешного ограничения
             await self.user_manager.update_user_status(sender_id, "restricted")
 
@@ -686,6 +693,8 @@ class TelegramBot:
                 f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
                 f"3 messages the same"
             ]
+            # Удаляем текущее сообщение
+            await message.delete()
             deleted_count = 0
             logging.warning(f"Удаление предыдущих сообщений ({message_ids_history}) от {sender_id} из-за повторов.")
             for msg_id in message_ids_history:
@@ -697,6 +706,10 @@ class TelegramBot:
                         logging.info(f"Предыдущее сообщение {msg_id} от {sender_id} уже удалено.")
                     else:
                         logging.error(f"Ошибка удаления предыдущего сообщения {msg_id} от {sender_id}: {e}")
+            # Ограничиваем пользователя
+            permissions = types.ChatPermissions(can_send_messages=False)
+            await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
+            logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: repeated messages")
             await self.user_manager.update_user_status(sender_id, "restricted")
 
             final_msg_to_master = "\n".join(msg_to_master_lines)
@@ -713,7 +726,7 @@ class TelegramBot:
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
                 f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
-                f"SPAMt"
+                f"SPAM"
             ]
 
             await message.delete()
@@ -728,6 +741,9 @@ class TelegramBot:
             formatted_report = TextProcessor.fix_markdown(final_msg_to_master)
             await self.bot.send_message(self.master_id, formatted_report, parse_mode="Markdown")
             return
+
+        # Сохраняем текст в историю для проверки повторов в будущем
+        await self.user_manager.update_user_text(sender_id, text, message.message_id)
 
 
     async def handle_media(self, message: types.Message):
