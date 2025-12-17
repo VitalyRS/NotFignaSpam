@@ -916,11 +916,50 @@ class TelegramBot:
         if not is_new_user:
             return
 
+        chat_id = message.chat.id
         logging.info(
             f"Новый пользователь {user_id} ({user_data['username']}) отправил медиа ({message.content_type}). Удаление.")
         try:
+            # Сначала записываем медиа в историю
             await self.user_manager.update_user_text(user_id, "medioFuck", message.message_id)
             await message.delete()
+            
+            # Получаем обновлённые данные для проверки повторов
+            async with self.user_manager.new_users_lock:
+                updated_data = self.user_manager.new_users.get(user_id, {})
+                messages_history = updated_data.get('text', [])
+                message_ids_history = updated_data.get('text_id', [])
+            
+            # Проверяем, есть ли 3 медиа-сообщения подряд
+            min_repetition_count = 3
+            if len(messages_history) >= min_repetition_count:
+                recent_messages = messages_history[-min_repetition_count:]
+                # Если все последние 3 сообщения — медиа ("medioFuck")
+                if all(msg == "medioFuck" for msg in recent_messages):
+                    logging.warning(f"Обнаружено {min_repetition_count} медиа подряд от {user_id}. Применяем рестрикт.")
+                    
+                    # Удаляем предыдущие сообщения (медиа)
+                    for msg_id in message_ids_history:
+                        try:
+                            await self.bot.delete_message(chat_id, msg_id)
+                        except TelegramBadRequest as e:
+                            if "message to delete not found" not in str(e):
+                                logging.error(f"Ошибка удаления сообщения {msg_id}: {e}")
+                    
+                    # Ограничиваем пользователя
+                    permissions = types.ChatPermissions(can_send_messages=False)
+                    await self.bot.restrict_chat_member(chat_id, user_id, permissions=permissions)
+                    logging.info(f"Пользователь {user_id} ограничен (только чтение). Причина: 3 медиа подряд")
+                    await self.user_manager.update_user_status(user_id, "restricted", "3 медиа подряд")
+                    
+                    await self.bot.send_message(
+                        self.master_id,
+                        f"🚫 Пользователь {user_data['username']} ({user_id}) заблокирован.\n"
+                        f"Причина: отправил 3 медиа подряд на карантине."
+                    )
+                    return
+            
+            # Если не было 3 медиа подряд — просто уведомляем об удалении
             await self.bot.send_message(
                 self.master_id,
                 f"🗑 Медиа ({message.content_type}) от нового пользователя {user_data['username']} ({user_id}) было удалено."
