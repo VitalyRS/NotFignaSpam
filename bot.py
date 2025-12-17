@@ -39,8 +39,21 @@ class DatabaseManager:
                     notified BOOLEAN,
                     status TEXT,
                     text JSONB,
-                    text_id JSONB
+                    text_id JSONB,
+                    restrict_reason TEXT
                 )
+            ''')
+            # Добавляем колонку restrict_reason если её нет (для существующих БД)
+            await conn.execute('''
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'users' AND column_name = 'restrict_reason'
+                    ) THEN
+                        ALTER TABLE users ADD COLUMN restrict_reason TEXT;
+                    END IF;
+                END $$;
             ''')
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS bad_words (
@@ -71,14 +84,15 @@ class DatabaseManager:
                     data.get('notified', False),
                     data.get('status', 'unknown'),
                     json.dumps(data.get('text', [])),  # Сериализуем список в JSON
-                    json.dumps(data.get('text_id', []))  # Сериализуем список в JSON
+                    json.dumps(data.get('text_id', [])),  # Сериализуем список в JSON
+                    data.get('restrict_reason', None)  # Причина ограничения
                 ))
 
             await conn.executemany('''
                 INSERT INTO users (
                     user_id, username, user_handle, join_time,
-                    notified, status, text, text_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
+                    notified, status, text, text_id, restrict_reason
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
             ''', records)
         finally:
             await conn.close()
@@ -100,7 +114,8 @@ class DatabaseManager:
                     'notified': row['notified'],
                     'status': row['status'],
                     'text': json.loads(row['text']) if row['text'] else [],  # Десериализуем JSON в список
-                    'text_id': json.loads(row['text_id']) if row['text_id'] else []  # Десериализуем JSON в список
+                    'text_id': json.loads(row['text_id']) if row['text_id'] else [],  # Десериализуем JSON в список
+                    'restrict_reason': row.get('restrict_reason')  # Причина ограничения
                 }
             return users
         finally:
@@ -293,11 +308,13 @@ class UserManager:
 
         return removed_count
 
-    async def update_user_status(self, user_id, new_status):
-        """Обновляет статус пользователя по его ID"""
+    async def update_user_status(self, user_id, new_status, restrict_reason=None):
+        """Обновляет статус пользователя по его ID и опционально причину ограничения"""
         async with self.new_users_lock:
             if user_id in self.new_users:
                 self.new_users[user_id]['status'] = new_status
+                if restrict_reason:
+                    self.new_users[user_id]['restrict_reason'] = restrict_reason
                 return True
             return False
 
@@ -695,7 +712,7 @@ class TelegramBot:
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: entities")
             # Обновляем статус в менеджере ПОСЛЕ успешного ограничения
-            await self.user_manager.update_user_status(sender_id, "restricted")
+            await self.user_manager.update_user_status(sender_id, "restricted", "Entities (ссылки/форматирование)")
 
             final_msg_to_master = "\n".join(msg_to_master_lines)
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
@@ -723,7 +740,7 @@ class TelegramBot:
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: non-latin/cyrillic symbols")
             # Обновляем статус в менеджере ПОСЛЕ успешного ограничения
-            await self.user_manager.update_user_status(sender_id, "restricted")
+            await self.user_manager.update_user_status(sender_id, "restricted", "Спецсимволы (не лат/кир)")
 
             final_msg_to_master = "\n".join(msg_to_master_lines)
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
@@ -747,7 +764,7 @@ class TelegramBot:
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: usdt usdc")
             # Обновляем статус в менеджере ПОСЛЕ успешного ограничения
-            await self.user_manager.update_user_status(sender_id, "restricted")
+            await self.user_manager.update_user_status(sender_id, "restricted", "USDT/USDC")
 
             final_msg_to_master = "\n".join(msg_to_master_lines)
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
@@ -808,7 +825,7 @@ class TelegramBot:
             permissions = types.ChatPermissions(can_send_messages=False)
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: repeated messages")
-            await self.user_manager.update_user_status(sender_id, "restricted")
+            await self.user_manager.update_user_status(sender_id, "restricted", "Повтор сообщений")
 
             final_msg_to_master = "\n".join(msg_to_master_lines)
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
@@ -832,7 +849,7 @@ class TelegramBot:
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: SPAM")
             # Обновляем статус в менеджере ПОСЛЕ успешного ограничения
-            await self.user_manager.update_user_status(sender_id, "restricted")
+            await self.user_manager.update_user_status(sender_id, "restricted", "ML-спам детектор")
 
             final_msg_to_master = "\n".join(msg_to_master_lines)
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
@@ -1052,16 +1069,10 @@ class TelegramBot:
                     join_str = "N/A"
                     time_str = "N/A"
                 
-                # Причина блокировки
-                reason = ""
-                if status == 'restricted' and texts:
-                    lt = texts[-1]
-                    if lt == "medioFuck":
-                        reason = "Медиа"
-                    elif "USDT" in str(lt).upper() or "USDC" in str(lt).upper():
-                        reason = "USDT/USDC"
-                    else:
-                        reason = "Спам"
+                # Причина блокировки (используем сохранённую причину)
+                reason = data.get('restrict_reason', '')
+                if not reason and status == 'restricted':
+                    reason = "Неизвестно"  # Для старых записей без причины
                 
                 # Сообщения (последние 3, до 50 символов каждое)
                 msgs = [html.escape(str(t)[:50]) for t in texts[-3:] if t != "medioFuck"]
@@ -1074,7 +1085,7 @@ class TelegramBot:
                     'join': join_str,
                     'time': time_str,
                     'clean': data.get('clean_messages', 0),
-                    'reason': reason,
+                    'reason': html.escape(reason) if reason else '',
                     'msgs': msgs,
                     'msg_count': len(texts)
                 })
