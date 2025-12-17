@@ -1031,36 +1031,489 @@ class TelegramBot:
 
 
     async def handle_index(self, request):
-        """Обработчик для корневого URL ('/')"""
-        html_body_parts = ["<h1>Содержимое моего словаря:</h1>"]
-        html_body_parts.append("<ul>")
-
+        """Обработчик для корневого URL ('/') — красивый дашборд"""
+        
+        quarantine_users = []  # статус member — на карантине
+        blocked_users = []     # статус restricted — заблокированы
+        all_messages = []      # все сообщения
+        
+        now = datetime.now(timezone.utc)
+        
         async with self.user_manager.new_users_lock:
-            for key, value in self.user_manager.new_users.items():
-                safe_key = html.escape(str(key))
-                safe_value = html.escape(str(value))
-                html_body_parts.append(f"<li><strong>{safe_key}:</strong> {safe_value}</li>")
+            for user_id, data in self.user_manager.new_users.items():
+                username = html.escape(data.get('username', 'N/A'))
+                user_handle = html.escape(data.get('user_handle', 'N/A'))
+                status = data.get('status', 'unknown')
+                join_time = data.get('join_time')
+                texts = data.get('text', [])
+                clean_count = data.get('clean_messages', 0)
+                
+                # Форматируем время
+                if isinstance(join_time, datetime):
+                    join_str = join_time.strftime('%d.%m.%Y %H:%M')
+                    time_passed = now - join_time.astimezone(timezone.utc)
+                    days = time_passed.days
+                    hours = time_passed.seconds // 3600
+                    time_in_quarantine = f"{days}д {hours}ч"
+                else:
+                    join_str = "N/A"
+                    time_in_quarantine = "N/A"
+                
+                user_info = {
+                    'id': user_id,
+                    'username': username,
+                    'handle': user_handle,
+                    'join_time': join_str,
+                    'time_in_quarantine': time_in_quarantine,
+                    'clean_messages': clean_count,
+                    'texts': texts
+                }
+                
+                if status == 'member':
+                    quarantine_users.append(user_info)
+                elif status == 'restricted':
+                    # Определяем причину блокировки по последнему сообщению
+                    reason = "Неизвестно"
+                    if texts:
+                        last_text = texts[-1] if texts else ""
+                        if last_text == "medioFuck":
+                            reason = "📷 Медиа от нового пользователя"
+                        elif "USDT" in str(last_text).upper() or "USDC" in str(last_text).upper():
+                            reason = "💰 Упоминание USDT/USDC"
+                        else:
+                            reason = "🚫 Спам / Подозрительное поведение"
+                    user_info['reason'] = reason
+                    blocked_users.append(user_info)
+                
+                # Собираем все сообщения
+                for i, txt in enumerate(texts):
+                    if txt != "medioFuck":
+                        safe_text = html.escape(str(txt)[:200])
+                        all_messages.append({
+                            'user_id': user_id,
+                            'username': username,
+                            'text': safe_text,
+                            'status': status
+                        })
+        
+        # Статистика
+        total_quarantine = len(quarantine_users)
+        total_blocked = len(blocked_users)
+        total_messages = len(all_messages)
+        
+        # Генерируем HTML для пользователей на карантине
+        quarantine_html = ""
+        if quarantine_users:
+            for u in quarantine_users:
+                quarantine_html += f'''
+                <div class="user-card quarantine">
+                    <div class="user-header">
+                        <span class="user-name">{u['username']}</span>
+                        <span class="user-badge">🔒 Карантин</span>
+                    </div>
+                    <div class="user-details">
+                        <div class="detail"><span class="label">ID:</span> <code>{u['id']}</code></div>
+                        <div class="detail"><span class="label">Хэндл:</span> {u['handle']}</div>
+                        <div class="detail"><span class="label">Вступил:</span> {u['join_time']}</div>
+                        <div class="detail"><span class="label">В карантине:</span> {u['time_in_quarantine']}</div>
+                        <div class="detail"><span class="label">Чистых сообщений:</span> {u['clean_messages']}/2</div>
+                    </div>
+                    <div class="user-messages">
+                        <span class="label">Сообщения ({len(u['texts'])}):</span>
+                        <div class="messages-list">
+                            {''.join(f'<div class="message">{html.escape(str(t)[:100])}</div>' for t in u['texts'] if t != "medioFuck") or '<div class="no-messages">Нет сообщений</div>'}
+                        </div>
+                    </div>
+                </div>
+                '''
+        else:
+            quarantine_html = '<div class="empty-state">✨ Нет пользователей на карантине</div>'
+        
+        # Генерируем HTML для заблокированных
+        blocked_html = ""
+        if blocked_users:
+            for u in blocked_users:
+                blocked_html += f'''
+                <div class="user-card blocked">
+                    <div class="user-header">
+                        <span class="user-name">{u['username']}</span>
+                        <span class="user-badge danger">🚫 Заблокирован</span>
+                    </div>
+                    <div class="user-details">
+                        <div class="detail"><span class="label">ID:</span> <code>{u['id']}</code></div>
+                        <div class="detail"><span class="label">Хэндл:</span> {u['handle']}</div>
+                        <div class="detail"><span class="label">Вступил:</span> {u['join_time']}</div>
+                        <div class="detail reason"><span class="label">Причина:</span> {u['reason']}</div>
+                    </div>
+                    <div class="user-messages">
+                        <span class="label">Последние сообщения:</span>
+                        <div class="messages-list">
+                            {''.join(f'<div class="message blocked-msg">{html.escape(str(t)[:100])}</div>' for t in u['texts'][-3:] if t != "medioFuck") or '<div class="no-messages">Нет сообщений</div>'}
+                        </div>
+                    </div>
+                </div>
+                '''
+        else:
+            blocked_html = '<div class="empty-state">✅ Нет заблокированных пользователей</div>'
+        
+        # Генерируем HTML для истории сообщений
+        messages_html = ""
+        if all_messages:
+            for m in all_messages[-20:]:  # последние 20
+                status_class = "blocked-msg" if m['status'] == 'restricted' else ""
+                messages_html += f'''
+                <div class="message-item {status_class}">
+                    <div class="message-header">
+                        <span class="msg-user">{m['username']}</span>
+                        <code class="msg-id">{m['user_id']}</code>
+                    </div>
+                    <div class="message-text">{m['text']}</div>
+                </div>
+                '''
+        else:
+            messages_html = '<div class="empty-state">📭 Нет сообщений</div>'
 
-        html_body_parts.append("</ul>")
-
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="ru">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Мои Данные</title>
-            <style>
-                body {{ font-family: sans-serif; }}
-                li {{ margin-bottom: 5px; }}
-                strong {{ color: #333; }}
-            </style>
-        </head>
-        <body>
-            {''.join(html_body_parts)}
-        </body>
-        </html>
-        """
+        html_content = f'''<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="60">
+    <title>🛡️ Anti-Spam Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 50%, #0d0d1f 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            padding: 20px;
+        }}
+        
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+        }}
+        
+        .header {{
+            text-align: center;
+            padding: 30px 0;
+            margin-bottom: 30px;
+        }}
+        
+        .header h1 {{
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+        }}
+        
+        .header p {{
+            color: #888;
+            font-size: 0.95rem;
+        }}
+        
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }}
+        
+        .stat-card {{
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 24px;
+            text-align: center;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }}
+        
+        .stat-card:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        }}
+        
+        .stat-number {{
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }}
+        
+        .stat-card.quarantine .stat-number {{ color: #ffc107; }}
+        .stat-card.blocked .stat-number {{ color: #ff5252; }}
+        .stat-card.messages .stat-number {{ color: #4caf50; }}
+        
+        .stat-label {{
+            color: #888;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        
+        .section {{
+            margin-bottom: 40px;
+        }}
+        
+        .section-title {{
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .users-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+        }}
+        
+        .user-card {{
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 20px;
+            transition: all 0.3s ease;
+        }}
+        
+        .user-card:hover {{
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(255, 255, 255, 0.15);
+            transform: translateY(-3px);
+        }}
+        
+        .user-card.quarantine {{
+            border-left: 4px solid #ffc107;
+        }}
+        
+        .user-card.blocked {{
+            border-left: 4px solid #ff5252;
+        }}
+        
+        .user-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }}
+        
+        .user-name {{
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #fff;
+        }}
+        
+        .user-badge {{
+            background: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }}
+        
+        .user-badge.danger {{
+            background: rgba(255, 82, 82, 0.2);
+            color: #ff5252;
+        }}
+        
+        .user-details {{
+            display: grid;
+            gap: 8px;
+            margin-bottom: 15px;
+        }}
+        
+        .detail {{
+            font-size: 0.9rem;
+            color: #aaa;
+        }}
+        
+        .detail .label {{
+            color: #666;
+            margin-right: 5px;
+        }}
+        
+        .detail.reason {{
+            color: #ff8a80;
+        }}
+        
+        code {{
+            background: rgba(102, 126, 234, 0.2);
+            color: #667eea;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.85rem;
+        }}
+        
+        .user-messages {{
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }}
+        
+        .messages-list {{
+            margin-top: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }}
+        
+        .message {{
+            background: rgba(255, 255, 255, 0.03);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            color: #ccc;
+            word-break: break-word;
+        }}
+        
+        .message.blocked-msg {{
+            background: rgba(255, 82, 82, 0.1);
+            border-left: 3px solid #ff5252;
+        }}
+        
+        .no-messages {{
+            color: #555;
+            font-style: italic;
+            font-size: 0.85rem;
+        }}
+        
+        .empty-state {{
+            text-align: center;
+            padding: 40px;
+            color: #666;
+            font-size: 1.1rem;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 16px;
+            border: 1px dashed rgba(255, 255, 255, 0.1);
+        }}
+        
+        .message-item {{
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            padding: 15px;
+            margin-bottom: 10px;
+            transition: all 0.2s ease;
+        }}
+        
+        .message-item:hover {{
+            background: rgba(255, 255, 255, 0.05);
+        }}
+        
+        .message-item.blocked-msg {{
+            border-left: 3px solid #ff5252;
+        }}
+        
+        .message-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }}
+        
+        .msg-user {{
+            font-weight: 600;
+            color: #667eea;
+        }}
+        
+        .msg-id {{
+            font-size: 0.75rem;
+        }}
+        
+        .message-text {{
+            color: #bbb;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            word-break: break-word;
+        }}
+        
+        .footer {{
+            text-align: center;
+            padding: 30px 0;
+            color: #444;
+            font-size: 0.85rem;
+        }}
+        
+        @media (max-width: 768px) {{
+            .header h1 {{
+                font-size: 1.8rem;
+            }}
+            
+            .users-grid {{
+                grid-template-columns: 1fr;
+            }}
+            
+            .stats {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛡️ Anti-Spam Dashboard</h1>
+            <p>Мониторинг пользователей чата • Обновляется каждые 60 секунд</p>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card quarantine">
+                <div class="stat-number">{total_quarantine}</div>
+                <div class="stat-label">🔒 На карантине</div>
+            </div>
+            <div class="stat-card blocked">
+                <div class="stat-number">{total_blocked}</div>
+                <div class="stat-label">🚫 Заблокировано</div>
+            </div>
+            <div class="stat-card messages">
+                <div class="stat-number">{total_messages}</div>
+                <div class="stat-label">📝 Сообщений</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2 class="section-title">🔒 Пользователи на карантине</h2>
+            <div class="users-grid">
+                {quarantine_html}
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2 class="section-title">🚫 Заблокированные пользователи</h2>
+            <div class="users-grid">
+                {blocked_html}
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2 class="section-title">📝 История сообщений (последние 20)</h2>
+            <div class="messages-container">
+                {messages_html}
+            </div>
+        </div>
+        
+        <div class="footer">
+            Anti-Spam Bot Dashboard • {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+        </div>
+    </div>
+</body>
+</html>'''
 
         return web.Response(text=html_content, content_type='text/html', charset='utf-8')
     async def health_check(self, request):
