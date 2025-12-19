@@ -27,7 +27,7 @@ class DatabaseManager:
         return await asyncpg.connect(dsn=self.dsn)
 
     async def init_db(self):
-        """Создаёт таблицы users и bad_words, если они не существуют"""
+        """Создаёт таблицы users, bad_words и settings, если они не существуют"""
         conn = await self._connect()
         try:
             await conn.execute('''
@@ -60,6 +60,33 @@ class DatabaseManager:
                     word TEXT PRIMARY KEY
                 )
             ''')
+            # Таблица для настроек бота
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
+        finally:
+            await conn.close()
+
+    async def get_setting(self, key: str, default: str = None) -> str:
+        """Получает значение настройки по ключу"""
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow('SELECT value FROM settings WHERE key = $1', key)
+            return row['value'] if row else default
+        finally:
+            await conn.close()
+
+    async def set_setting(self, key: str, value: str):
+        """Устанавливает значение настройки"""
+        conn = await self._connect()
+        try:
+            await conn.execute('''
+                INSERT INTO settings (key, value) VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE SET value = $2
+            ''', key, value)
         finally:
             await conn.close()
 
@@ -325,6 +352,9 @@ class UserManager:
         async with self.new_users_lock:
             return self.new_users.copy()  # Возвращаем копию для безопасности
 class TelegramBot:
+    # Дефолтное сообщение при выходе из карантина
+    DEFAULT_QUARANTINE_EXIT_MSG = "Вы вышли с карантина, вам даны полные права"
+
     def __init__(self):
         self.bot = Bot(token=os.environ.get("TELEGRAM_BOT_TOKEN"))
         self.dp = Dispatcher()
@@ -336,6 +366,8 @@ class TelegramBot:
         self.webhook_url = os.environ.get("WEBHOOK_URL")
         self.webhook_path = f"/{os.environ.get('TELEGRAM_BOT_TOKEN')}"
 
+        # Кастомное сообщение при выходе из карантина (загружается из БД)
+        self.quarantine_exit_msg = self.DEFAULT_QUARANTINE_EXIT_MSG
 
         self.spam_detector = SpamDetector()
         dsn=os.environ.get("DSN")
@@ -352,6 +384,7 @@ class TelegramBot:
         self.router.message(Command(commands=['strange']))(self.show_strange)
         self.router.message(Command(commands=['restrict']))(self.restrict)
         self.router.message(Command(commands=['addc']))(self.add_to_clean)
+        self.router.message(Command(commands=['change']))(self.change_exit_message)
         self.router.chat_member()(self.handle_chat_member)
         self.router.message(F.text)(self.handle_message)
         self.router.message(F.photo | F.video | F.audio | F.document |
@@ -366,13 +399,14 @@ class TelegramBot:
         if message.from_user.id != self.master_id:
             return
 
-        help_text = """
+        help_text = f"""
 🤖 *Команды бота Anti-Spam:*
 
 📋 *Управление карантином:*
 • `/strange` — показать новых пользователей на карантине
 • `/addc <user_id>` — убрать пользователя из карантина и дать полные права
 • `/restrict <id1,id2,...>` — ограничить права пользователям
+• `/change <текст>` — изменить сообщение при выходе из карантина
 
 🚫 *Чёрные списки:*
 • `/suka <никнейм>` — добавить никнейм в чёрный список
@@ -387,6 +421,9 @@ class TelegramBot:
 • Блокировка при 3 одинаковых сообщениях
 • Проверка на спам (ML модель)
 • Автопромоут после 2 чистых сообщений
+
+💬 *Текущее сообщение при выходе из карантина:*
+`{self.quarantine_exit_msg}`
 """
         await message.reply(help_text, parse_mode="Markdown")
 
@@ -447,6 +484,36 @@ class TelegramBot:
         except Exception as e:
             logging.error(f"Ошибка при удалении пользователя {user_id} из карантина: {e}", exc_info=True)
             await message.reply(f"❌ Ошибка: {e}")
+
+    async def change_exit_message(self, message: types.Message):
+        """Изменяет сообщение при выходе из карантина"""
+        if message.from_user.id != self.master_id:
+            return
+
+        command_parts = message.text.split(maxsplit=1)
+        if len(command_parts) < 2 or not command_parts[1].strip():
+            await message.reply(
+                f"📝 *Текущее сообщение при выходе из карантина:*\n"
+                f"`{self.quarantine_exit_msg}`\n\n"
+                f"Чтобы изменить, отправьте: `/change Ваш новый текст`",
+                parse_mode="Markdown"
+            )
+            return
+
+        new_message = command_parts[1].strip()
+        self.quarantine_exit_msg = new_message
+        
+        try:
+            await self.db_manager.set_setting('quarantine_exit_msg', new_message)
+            await message.reply(
+                f"✅ Сообщение при выходе из карантина изменено на:\n"
+                f"`{new_message}`",
+                parse_mode="Markdown"
+            )
+            logging.info(f"Мастер изменил сообщение выхода из карантина на: {new_message}")
+        except Exception as e:
+            logging.error(f"Ошибка сохранения настройки quarantine_exit_msg: {e}", exc_info=True)
+            await message.reply(f"⚠️ Сообщение изменено, но не сохранено в БД: {e}")
 
     async def add_nickname(self, message: types.Message):
         if message.from_user.id != self.master_id:
@@ -887,6 +954,12 @@ class TelegramBot:
                 
                 logging.info(f"Пользователь {sender_id} ({user_data.get('username')}) прошёл проверку (2 чистых сообщения). Полные права восстановлены.")
                 
+                # Отправляем пользователю сообщение о выходе из карантина (реплаем на его сообщение)
+                try:
+                    await message.reply(self.quarantine_exit_msg)
+                except Exception as reply_err:
+                    logging.error(f"Не удалось отправить сообщение о выходе из карантина пользователю {sender_id}: {reply_err}")
+                
                 await self.bot.send_message(
                     self.master_id,
                     f"✅ Пользователь прошёл проверку:\n"
@@ -1013,6 +1086,13 @@ class TelegramBot:
             log_message = f"Загружено {len(loaded_users)} пользователей из БД."
             logging.info(log_message)
             self.user_manager.bad_nicknames= await self.db_manager.load_bad_words()
+            
+            # Загружаем кастомное сообщение выхода из карантина
+            custom_exit_msg = await self.db_manager.get_setting('quarantine_exit_msg')
+            if custom_exit_msg:
+                self.quarantine_exit_msg = custom_exit_msg
+                logging.info(f"Загружено кастомное сообщение выхода из карантина: {custom_exit_msg}")
+            
             print(log_message)
         except Exception as e:
             log_message = f"КРИТИЧЕСКАЯ ОШИБКА загрузки БД при старте: {e}"
