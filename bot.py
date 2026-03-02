@@ -763,8 +763,18 @@ class TelegramBot:
 
 
         entities = message.entities or message.caption_entities  # Берём entities текста или подписи
+        has_link_preview = getattr(message, 'link_preview_options', None) and getattr(message.link_preview_options, 'url', None)
+        has_forward = getattr(message, 'forward_origin', None) is not None
 
-        if  entities:
+        if entities or has_link_preview or has_forward:
+            reason_str = "Entities/Скрытые ссылки/Форварды"
+            if has_link_preview:
+                reason_str = "Скрытая ссылка (Link Preview)"
+            elif has_forward:
+                reason_str = "Пересланное сообщение (Forward)"
+            else:
+                reason_str = "Entities (ссылки/форматирование)"
+
             # Формирование отчета для админа (добавим флаг повтора)
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
@@ -772,14 +782,14 @@ class TelegramBot:
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
                 f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
-                f"Entities"
+                reason_str
             ]
             await message.delete()
             permissions = types.ChatPermissions(can_send_messages=False)
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
-            logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: entities")
+            logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: {reason_str}")
             # Обновляем статус в менеджере ПОСЛЕ успешного ограничения
-            await self.user_manager.update_user_status(sender_id, "restricted", "Entities (ссылки/форматирование)")
+            await self.user_manager.update_user_status(sender_id, "restricted", reason_str)
 
             final_msg_to_master = "\n".join(msg_to_master_lines)
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
