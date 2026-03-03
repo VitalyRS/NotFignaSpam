@@ -76,6 +76,19 @@ class DatabaseManager:
                     PRIMARY KEY (user_id, topic_type)
                 )
             ''')
+            # Добавляем колонки username и user_handle в таблицу topic_limits (для миграции существующих БД)
+            await conn.execute('''
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'topic_limits' AND column_name = 'username'
+                    ) THEN
+                        ALTER TABLE topic_limits ADD COLUMN username TEXT;
+                        ALTER TABLE topic_limits ADD COLUMN user_handle TEXT;
+                    END IF;
+                END $$;
+            ''')
         finally:
             await conn.close()
 
@@ -105,10 +118,10 @@ class DatabaseManager:
     async def set_topic_map(self, thread_id: int, topic_type: str):
         await self.set_setting(f'topic_map_{thread_id}', topic_type)
 
-    async def check_topic_limit(self, user_id: int, topic_type: str, limit_hours: int) -> bool:
+    async def check_topic_limit(self, user_id: int, topic_type: str, limit_hours: int, username: str = None, user_handle: str = None) -> bool:
         """
         Проверяет, прошло ли limit_hours с момента последнего сообщения пользователя в данном топике.
-        Если прошло (или сообщений не было) - обновляет время и возвращает True.
+        Если прошло (или сообщений не было) - обновляет время и имя и возвращает True.
         Иначе возвращает False.
         """
         conn = await self._connect()
@@ -128,11 +141,11 @@ class DatabaseManager:
                     return False
                     
             await conn.execute('''
-                INSERT INTO topic_limits (user_id, topic_type, last_msg_time) 
-                VALUES ($1, $2, $3)
+                INSERT INTO topic_limits (user_id, topic_type, last_msg_time, username, user_handle) 
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (user_id, topic_type) 
-                DO UPDATE SET last_msg_time = $3
-            ''', user_id, topic_type, now)
+                DO UPDATE SET last_msg_time = $3, username = $4, user_handle = $5
+            ''', user_id, topic_type, now, username, user_handle)
             return True
         finally:
             await conn.close()
@@ -152,12 +165,10 @@ class DatabaseManager:
         """Возвращает все текущие лимиты для отрисовки в дашборде."""
         conn = await self._connect()
         try:
-            # Делаем LEFT JOIN, чтобы выводить лимиты даже если пользователя нет в кэше users (он старый)
             rows = await conn.fetch('''
-                SELECT t.user_id, t.topic_type, t.last_msg_time, u.username, u.user_handle
-                FROM topic_limits t
-                LEFT JOIN users u ON t.user_id = u.user_id
-                ORDER BY t.last_msg_time DESC
+                SELECT user_id, topic_type, last_msg_time, username, user_handle
+                FROM topic_limits 
+                ORDER BY last_msg_time DESC
             ''')
             return [dict(row) for row in rows]
         finally:
@@ -790,7 +801,7 @@ class TelegramBot:
                         return True
                 
                 # Flood control 72h
-                if not await self.db_manager.check_topic_limit(user_id, topic_type, 72):
+                if not await self.db_manager.check_topic_limit(user_id, topic_type, 72, message.from_user.first_name, message.from_user.username):
                     warn_msg = await message.reply(
                          f"⏳ Привет, {message.from_user.first_name}! В топике «Посылки» можно писать не чаще 1 раза в 72 часа.\n\n"
                          f"Ваше сообщение было удалено. Пожалуйста, подождите перед следующей публикацией.",
@@ -817,7 +828,7 @@ class TelegramBot:
                         return True
                 
                 # Flood control 24h
-                if not await self.db_manager.check_topic_limit(user_id, topic_type, 24):
+                if not await self.db_manager.check_topic_limit(user_id, topic_type, 24, message.from_user.first_name, message.from_user.username):
                     warn_msg = await message.reply(
                          f"⏳ Привет, {message.from_user.first_name}! В топике «Объявления» можно писать не чаще 1 раза в 24 часа.\n\n"
                          f"Ваше сообщение было удалено. Пожалуйста, подождите перед следующей публикацией.",
