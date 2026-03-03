@@ -152,10 +152,12 @@ class DatabaseManager:
         """Возвращает все текущие лимиты для отрисовки в дашборде."""
         conn = await self._connect()
         try:
+            # Делаем LEFT JOIN, чтобы выводить лимиты даже если пользователя нет в кэше users (он старый)
             rows = await conn.fetch('''
-                SELECT user_id, topic_type, last_msg_time 
-                FROM topic_limits 
-                ORDER BY last_msg_time DESC
+                SELECT t.user_id, t.topic_type, t.last_msg_time, u.username, u.user_handle
+                FROM topic_limits t
+                LEFT JOIN users u ON t.user_id = u.user_id
+                ORDER BY t.last_msg_time DESC
             ''')
             return [dict(row) for row in rows]
         finally:
@@ -1671,6 +1673,8 @@ setTimeout(checkUpdates,30000);
         rows = []
         for limit in limits:
             user_id = limit['user_id']
+            username = limit.get('username') or 'Неизвестно'
+            handle = limit.get('user_handle') or ''
             topic_type = limit['topic_type']
             last_msg_time = limit['last_msg_time']
             if last_msg_time.tzinfo is None:
@@ -1695,10 +1699,10 @@ setTimeout(checkUpdates,30000);
             time_str = last_msg_time.strftime('%d.%m %H:%M')
             
             rows.append(f'''<tr class="{status_class}">
-<td>{status_badge}</td><td><code>{user_id}</code></td><td>{topic_type}</td><td>{time_str}</td><td>{status_text}</td>
+<td>{status_badge}</td><td><code>{user_id}</code></td><td>{html.escape(username)}</td><td>{html.escape(handle)}</td><td>{topic_type}</td><td>{time_str}</td><td>{status_text}</td>
 </tr>''')
         
-        table_html = ''.join(rows) if rows else '<tr><td colspan="5" class="empty">Нет активных лимитов</td></tr>'
+        table_html = ''.join(rows) if rows else '<tr><td colspan="7" class="empty">Нет активных лимитов</td></tr>'
 
         html_content = f'''<!DOCTYPE html><html lang="ru"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1726,7 +1730,7 @@ setTimeout(() => location.reload(), 30000);
 </div>
 <h1>⏳ Лимиты (Флуд-Контроль)</h1>
 <table>
-<tr><th>⚡</th><th>ID Пользователя</th><th>Тип топика</th><th>Последнее сообщение</th><th>Статус</th></tr>
+<tr><th>⚡</th><th>ID Пользователя</th><th>Имя</th><th>Хэндл</th><th>Тип топика</th><th>Последнее сообщение</th><th>Статус</th></tr>
 {table_html}
 </table>
 <div class="footer">Обновление: {datetime.now().strftime('%H:%M:%S')}</div>
