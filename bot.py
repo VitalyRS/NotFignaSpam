@@ -661,7 +661,7 @@ class TelegramBot:
         if len(command_parts) < 2 or not command_parts[1].strip():
             await message.reply(
                 "Использование: `/set_topic <тип>`\n"
-                "Типы: `news`, `visa`, `parcels`, `ads`, `feedback`, `life`, "
+                "Типы: `news`, `visa`, `sos`, `parcels`, `ads`, `feedback`, `life`, "
                 "`spanish`, `tourism`, `family`, `dating`, `chat`",
                 parse_mode="Markdown"
             )
@@ -705,8 +705,8 @@ class TelegramBot:
             msg_tags = message.caption.lower()
 
         try:
-            # visa, feedback: no video, video_note, voice
-            if topic_type in ['visa', 'feedback']:
+            # visa, sos, feedback: no video, video_note, voice
+            if topic_type in ['visa', 'sos', 'feedback']:
                 if message.video or message.video_note or message.voice:
                     await message.delete()
                     return True
