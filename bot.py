@@ -137,6 +137,30 @@ class DatabaseManager:
         finally:
             await conn.close()
 
+    async def reset_topic_limit(self, user_id: int, topic_type: str):
+        """Сбрасывает лимит по времени для конкретного пользователя в топике."""
+        conn = await self._connect()
+        try:
+            await conn.execute('''
+                DELETE FROM topic_limits 
+                WHERE user_id = $1 AND topic_type = $2
+            ''', user_id, topic_type)
+        finally:
+            await conn.close()
+
+    async def get_all_topic_limits(self) -> list:
+        """Возвращает все текущие лимиты для отрисовки в дашборде."""
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch('''
+                SELECT user_id, topic_type, last_msg_time 
+                FROM topic_limits 
+                ORDER BY last_msg_time DESC
+            ''')
+            return [dict(row) for row in rows]
+        finally:
+            await conn.close()
+
     async def save_users_to_db(self, users: Dict[int, Dict]):
         """
         Сохраняет пользователей в БД
@@ -467,6 +491,7 @@ class TelegramBot:
         self.router.message(Command(commands=['addc']))(self.add_to_clean)
         self.router.message(Command(commands=['change']))(self.change_exit_message)
         self.router.message(Command(commands=['set_topic']))(self.set_topic)
+        self.router.message(Command(commands=['reset_limit']))(self.reset_limit)
         self.router.chat_member()(self.handle_chat_member)
         self.router.message(F.text)(self.handle_message)
         self.router.message(F.photo | F.video | F.audio | F.document |
@@ -681,6 +706,35 @@ class TelegramBot:
             logging.error(f"Ошибка привязки топика: {e}", exc_info=True)
             await message.reply(f"⚠️ Ошибка привязки: {e}")
 
+    async def reset_limit(self, message: types.Message):
+        """Сбрасывает таймер флуд-контроля для указанного пользователя и топика."""
+        if message.from_user.id != self.master_id:
+            return
+            
+        command_parts = message.text.split()
+        if len(command_parts) != 3:
+            await message.reply(
+                "Использование: `/reset_limit <ID_пользователя> <тип_топика>`\n"
+                "Пример: `/reset_limit 123456789 ads`",
+                parse_mode="Markdown"
+            )
+            return
+            
+        try:
+            user_id = int(command_parts[1].strip())
+            topic_type = command_parts[2].strip()
+        except ValueError:
+            await message.reply("❌ ID пользователя должен быть числом.")
+            return
+
+        try:
+            await self.db_manager.reset_topic_limit(user_id, topic_type)
+            await message.reply(f"✅ Лимит публикации для пользователя `{user_id}` в топике `{topic_type}` сброшен!", parse_mode="Markdown")
+            logging.info(f"Мастер сбросил лимит пользователя {user_id} для топика {topic_type}")
+        except Exception as e:
+            logging.error(f"Ошибка при сбросе лимита: {e}", exc_info=True)
+            await message.reply(f"⚠️ Ошибка сброса лимита: {e}")
+
     async def check_topic_rules(self, message: types.Message) -> bool:
         """Проверяет правила подгрупп для сообщения. Возвращает True, если сообщение было удалено."""
         if message.chat.id != self.target_chat_id:
@@ -711,46 +765,64 @@ class TelegramBot:
                     await message.delete()
                     return True
 
-            # parcels: no video, video_note, voice, photo
+            # parcels: no video_note, voice
             if topic_type == 'parcels':
-                if message.video or message.video_note or message.voice or message.photo:
+                if message.video_note or message.voice:
                     await message.delete()
                     return True
                 
                 # Tag validation 
                 tags = ['#ищу', '#передам', '#еду', '#куда', '#из', '#возьму']
                 if not any(tag in msg_tags for tag in tags):
+                    if message.media_group_id and not msg_tags:
+                        pass # Skip empty caption elements in media group
+                    else:
+                        warn_msg = await message.reply(
+                             f"⚠️ Привет, {message.from_user.first_name}! В топике «Посылки» обязательно использование хотя бы одного из тегов: "
+                             f"`" + "`, `".join(tags) + "`.\n\n"
+                             f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
+                             parse_mode="Markdown"
+                        )
+                        await message.delete()
+                        asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
+                        return True
+                
+                # Flood control 72h
+                if not await self.db_manager.check_topic_limit(user_id, topic_type, 72):
                     warn_msg = await message.reply(
-                         f"⚠️ Привет, {message.from_user.first_name}! В топике «Посылки» обязательно использование хотя бы одного из тегов: "
-                         f"`" + "`, `".join(tags) + "`.\n\n"
-                         f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
+                         f"⏳ Привет, {message.from_user.first_name}! В топике «Посылки» можно писать не чаще 1 раза в 72 часа.\n\n"
+                         f"Ваше сообщение было удалено. Пожалуйста, подождите перед следующей публикацией.",
                          parse_mode="Markdown"
                     )
                     await message.delete()
                     asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
-                    return True
-                
-                # Flood control 72h
-                if not await self.db_manager.check_topic_limit(user_id, topic_type, 72):
-                    await message.delete()
                     return True
 
             if topic_type == 'ads':
                 tags = ['#услуги', '#работа', '#квартира']
                 if not any(tag in msg_tags for tag in tags):
+                    if message.media_group_id and not msg_tags:
+                        pass # Skip empty caption elements in media group
+                    else:
+                        warn_msg = await message.reply(
+                             f"⚠️ Привет, {message.from_user.first_name}! В топике «Объявления» обязательно использование хотя бы одного из тегов: "
+                             f"`" + "`, `".join(tags) + "`.\n\n"
+                             f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
+                             parse_mode="Markdown"
+                        )
+                        await message.delete()
+                        asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
+                        return True
+                
+                # Flood control 24h
+                if not await self.db_manager.check_topic_limit(user_id, topic_type, 24):
                     warn_msg = await message.reply(
-                         f"⚠️ Привет, {message.from_user.first_name}! В топике «Объявления» обязательно использование хотя бы одного из тегов: "
-                         f"`" + "`, `".join(tags) + "`.\n\n"
-                         f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
+                         f"⏳ Привет, {message.from_user.first_name}! В топике «Объявления» можно писать не чаще 1 раза в 24 часа.\n\n"
+                         f"Ваше сообщение было удалено. Пожалуйста, подождите перед следующей публикацией.",
                          parse_mode="Markdown"
                     )
                     await message.delete()
                     asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
-                    return True
-                
-                # Flood control 24h
-                if not await self.db_manager.check_topic_limit(user_id, topic_type, 24):
-                    await message.delete()
                     return True
 
         except Exception as e:
@@ -996,6 +1068,13 @@ class TelegramBot:
                 # Получаем копию, чтобы работать с ней вне блока lock
                 user_data = self.user_manager.new_users.get(sender_id)  # Используем .get для безопасности
 
+        thread_id = message.message_thread_id
+        topic_name = "Обычный чат"
+        if thread_id:
+            topic_type = await self.db_manager.get_topic_map(thread_id)
+            if topic_type:
+                topic_name = topic_type
+
         # Если пользователя нет в словаре новых, обрабатываем как старого
         if not user_data:
             logging.debug(f"Сообщение от неотслеживаемого пользователя {sender_id}")
@@ -1006,6 +1085,7 @@ class TelegramBot:
                 f"ID message: {message.message_id}\n"
                 f"ID sender: {sender_id}\n"
                 f"User Name: {message.from_user.username}\n"
+                f"Топик: {topic_name}\n"
                 f"Текст:\n```\n{text}\n```\n"
             )
             final_msg_to_master = TextProcessor.fix_markdown(final_msg_to_master)
@@ -1039,6 +1119,7 @@ class TelegramBot:
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
+                f"Топик: {topic_name}",
                 f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
                 reason_str
             ]
@@ -1071,6 +1152,7 @@ class TelegramBot:
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
+                f"Топик: {topic_name}",
                 f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
                 f"Non-latin/cyrillic symbols detected"
             ]
@@ -1100,6 +1182,7 @@ class TelegramBot:
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
+                f"Топик: {topic_name}",
                 f"Текст (ID: {message.message_id}):\n```\n{text}\n```",  # Не экранируем Markdown для логов/принта
                 f"USDT/ USDC"
             ]
@@ -1282,6 +1365,14 @@ class TelegramBot:
 
         if not is_new_user:
             return
+
+        # Исключение для топиков Объявления и Посылки
+        # Проверка правил этих топиков (тегов и тд) уже прошла успешно в check_topic_rules
+        thread_id = message.message_thread_id
+        if thread_id:
+            topic_type = await self.db_manager.get_topic_map(thread_id)
+            if topic_type in ['ads', 'parcels']:
+                return
 
         chat_id = message.chat.id
         logging.info(
@@ -1555,6 +1646,9 @@ setTimeout(checkUpdates,30000)}}
 setTimeout(checkUpdates,30000);
 </script>
 </head><body>
+<div style="text-align: right; margin-bottom: 10px;">
+<a href="/limits" style="color: #667eea; text-decoration: none; border: 1px solid #667eea; padding: 5px 10px; border-radius: 5px;">⏳ Дашборд Лимитов</a>
+</div>
 <h1>🛡️ Anti-Spam Dashboard</h1>
 <div class="stats">
 <div class="stat q"><b>{q_count}</b>На карантине</div>
@@ -1565,6 +1659,77 @@ setTimeout(checkUpdates,30000);
 {table_html}
 </table>
 <div class="footer">Обновление: {datetime.now().strftime('%H:%M:%S')} <span class="hash">#{data_hash}</span></div>
+</body></html>'''
+        
+        return web.Response(text=html_content, content_type='text/html', charset='utf-8')
+
+    async def handle_limits(self, request):
+        """Обработчик для URL ('/limits') — таблица ограничений по времени"""
+        limits = await self.db_manager.get_all_topic_limits()
+        now = datetime.now(timezone.utc)
+        
+        rows = []
+        for limit in limits:
+            user_id = limit['user_id']
+            topic_type = limit['topic_type']
+            last_msg_time = limit['last_msg_time']
+            if last_msg_time.tzinfo is None:
+                last_msg_time = last_msg_time.replace(tzinfo=timezone.utc)
+                
+            limit_hours = 24 if topic_type == 'ads' else 72
+            time_passed = now - last_msg_time
+            hours_passed = time_passed.total_seconds() / 3600
+            
+            # Статус блокировки
+            is_blocked = hours_passed < limit_hours
+            status_badge = '🔴' if is_blocked else '🟢'
+            status_class = 'blocked' if is_blocked else 'quarantine'
+            
+            if is_blocked:
+                left_hours = int(limit_hours - hours_passed)
+                left_mins = int((limit_hours - hours_passed - left_hours) * 60)
+                status_text = f"Осталось {left_hours}ч {left_mins}м"
+            else:
+                status_text = "Лимит прошел"
+                
+            time_str = last_msg_time.strftime('%d.%m %H:%M')
+            
+            rows.append(f'''<tr class="{status_class}">
+<td>{status_badge}</td><td><code>{user_id}</code></td><td>{topic_type}</td><td>{time_str}</td><td>{status_text}</td>
+</tr>''')
+        
+        table_html = ''.join(rows) if rows else '<tr><td colspan="5" class="empty">Нет активных лимитов</td></tr>'
+
+        html_content = f'''<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⏳ Лимиты Дашборд</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:system-ui,sans-serif;background:#0f0f1a;color:#ccc;padding:15px}}
+h1{{text-align:center;color:#667eea;margin-bottom:20px;font-size:1.5rem}}
+table{{width:100%;border-collapse:collapse;font-size:0.85rem}}
+th,td{{padding:8px 6px;text-align:left;border-bottom:1px solid #222}}
+th{{background:#1a1a2e;color:#888;font-weight:500;position:sticky;top:0}}
+tr.quarantine{{background:rgba(40,167,69,0.05)}}
+tr.blocked{{background:rgba(255,82,82,0.05)}}
+tr:hover{{background:rgba(255,255,255,0.05)}}
+code{{background:#252540;padding:2px 6px;border-radius:3px;color:#667eea;font-size:0.8rem}}
+.empty{{text-align:center;color:#555;padding:40px}}
+.footer{{text-align:center;color:#333;margin-top:20px;font-size:0.75rem}}
+</style>
+<script>
+setTimeout(() => location.reload(), 30000);
+</script>
+</head><body>
+<div style="text-align: left; margin-bottom: 10px;">
+<a href="/" style="color: #667eea; text-decoration: none; border: 1px solid #667eea; padding: 5px 10px; border-radius: 5px;">🔙 Назад в Карантин</a>
+</div>
+<h1>⏳ Лимиты (Флуд-Контроль)</h1>
+<table>
+<tr><th>⚡</th><th>ID Пользователя</th><th>Тип топика</th><th>Последнее сообщение</th><th>Статус</th></tr>
+{table_html}
+</table>
+<div class="footer">Обновление: {datetime.now().strftime('%H:%M:%S')}</div>
 </body></html>'''
         
         return web.Response(text=html_content, content_type='text/html', charset='utf-8')
@@ -1600,6 +1765,7 @@ setTimeout(checkUpdates,30000);
         host = os.environ.get('HOST', '0.0.0.0')
 
         app_aiogram.router.add_get('/', self.handle_index)
+        app_aiogram.router.add_get('/limits', self.handle_limits)
         app_aiogram.router.add_get('/api/hash', self.handle_api_hash)
         app_aiogram.router.add_get('/health',self.health_check)
 
