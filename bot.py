@@ -1017,6 +1017,7 @@ class TelegramBot:
 
     async def handle_chat_member(self, update: types.ChatMemberUpdated):
         new_status = update.new_chat_member.status
+        old_status = update.old_chat_member.status
         user = update.new_chat_member.user
         user_id = user.id
         username = user.full_name
@@ -1025,7 +1026,7 @@ class TelegramBot:
         event_time_dt = update.date
 
         if chat_id == self.target_chat_id:
-            if new_status == "member":
+            if new_status == "member" and old_status in ["left", "kicked", "creator"]:
                 await self.user_manager.add_user(user_id, {
                     'username': username,
                     'user_handle': user_handle,
