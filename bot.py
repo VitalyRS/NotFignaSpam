@@ -546,6 +546,7 @@ class TelegramBot:
         self.router.message(Command(commands=['change']))(self.change_exit_message)
         self.router.message(Command(commands=['set_topic']))(self.set_topic)
         self.router.message(Command(commands=['reset_limit']))(self.reset_limit)
+        self.router.message(Command(commands=['nolim']))(self.nolim_user)
         self.router.chat_member()(self.handle_chat_member)
         self.router.message(F.text)(self.handle_message)
         self.router.message(F.photo | F.video | F.audio | F.document |
@@ -577,6 +578,7 @@ class TelegramBot:
 
 ⚙️ *Настройка системы:*
 • `/set_topic <тип>` — привязать текущий топик к антиспам-правилам
+• `/nolim <ID>` — снять флуд-контроль в ads и parcels
 
 ℹ️ `/help` — показать это сообщение
 
@@ -787,6 +789,35 @@ class TelegramBot:
             logging.info(f"Мастер сбросил лимит пользователя {user_id} для топика {topic_type}")
         except Exception as e:
             logging.error(f"Ошибка при сбросе лимита: {e}", exc_info=True)
+            await message.reply(f"⚠️ Ошибка сброса лимита: {e}")
+
+    async def nolim_user(self, message: types.Message):
+        """Снимает флуд контроль в ads и parcels для пользователя."""
+        if message.from_user.id != self.master_id:
+            return
+            
+        command_parts = message.text.split()
+        if len(command_parts) != 2:
+            await message.reply(
+                "Использование: `/nolim <ID_пользователя>`\n"
+                "Пример: `/nolim 123456789`",
+                parse_mode="Markdown"
+            )
+            return
+            
+        try:
+            user_id = int(command_parts[1].strip())
+        except ValueError:
+            await message.reply("❌ ID пользователя должен быть числом.")
+            return
+
+        try:
+            await self.db_manager.reset_topic_limit(user_id, 'ads')
+            await self.db_manager.reset_topic_limit(user_id, 'parcels')
+            await message.reply(f"✅ Флуд-контроль для пользователя `{user_id}` в темах `ads` и `parcels` успешно снят!", parse_mode="Markdown")
+            logging.info(f"Мастер снял флуд контроль пользователя {user_id} для ads и parcels")
+        except Exception as e:
+            logging.error(f"Ошибка при сбросе лимитов: {e}", exc_info=True)
             await message.reply(f"⚠️ Ошибка сброса лимита: {e}")
 
     async def check_topic_rules(self, message: types.Message) -> bool:
