@@ -53,6 +53,12 @@ class DatabaseManager:
                     ) THEN
                         ALTER TABLE users ADD COLUMN restrict_reason TEXT;
                     END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'users' AND column_name = 'clean_messages'
+                    ) THEN
+                        ALTER TABLE users ADD COLUMN clean_messages INTEGER DEFAULT 0;
+                    END IF;
                 END $$;
             ''')
             await conn.execute('''
@@ -181,12 +187,14 @@ class DatabaseManager:
         """
         conn = await self._connect()
         try:
-            await conn.execute("TRUNCATE TABLE users")
             if not users:
+                await conn.execute("TRUNCATE TABLE users")
                 return
 
             records = []
+            user_ids_in_dict = []
             for user_id, data in users.items():
+                user_ids_in_dict.append(int(user_id))
                 records.append((
                     int(user_id),
                     data.get('username', ''),
@@ -196,15 +204,28 @@ class DatabaseManager:
                     data.get('status', 'unknown'),
                     json.dumps(data.get('text', [])),  # Сериализуем список в JSON
                     json.dumps(data.get('text_id', [])),  # Сериализуем список в JSON
-                    data.get('restrict_reason', None)  # Причина ограничения
+                    data.get('restrict_reason', None),  # Причина ограничения
+                    data.get('clean_messages', 0)
                 ))
 
-            await conn.executemany('''
-                INSERT INTO users (
-                    user_id, username, user_handle, join_time,
-                    notified, status, text, text_id, restrict_reason
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
-            ''', records)
+            async with conn.transaction():
+                await conn.execute('DELETE FROM users WHERE NOT (user_id = ANY($1::bigint[]))', user_ids_in_dict)
+                await conn.executemany('''
+                    INSERT INTO users (
+                        user_id, username, user_handle, join_time,
+                        notified, status, text, text_id, restrict_reason, clean_messages
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        user_handle = EXCLUDED.user_handle,
+                        join_time = EXCLUDED.join_time,
+                        notified = EXCLUDED.notified,
+                        status = EXCLUDED.status,
+                        text = EXCLUDED.text,
+                        text_id = EXCLUDED.text_id,
+                        restrict_reason = EXCLUDED.restrict_reason,
+                        clean_messages = EXCLUDED.clean_messages
+                ''', records)
         finally:
             await conn.close()
 
@@ -226,7 +247,8 @@ class DatabaseManager:
                     'status': row['status'],
                     'text': json.loads(row['text']) if row['text'] else [],  # Десериализуем JSON в список
                     'text_id': json.loads(row['text_id']) if row['text_id'] else [],  # Десериализуем JSON в список
-                    'restrict_reason': row.get('restrict_reason')  # Причина ограничения
+                    'restrict_reason': row.get('restrict_reason'),  # Причина ограничения
+                    'clean_messages': row.get('clean_messages', 0)
                 }
             return users
         finally:
@@ -353,19 +375,27 @@ class SpamDetector:
             logging.error(f"Ошибка в предсказании: {e}", exc_info=True)
             return 0
 class UserManager:
-    def __init__(self):
+    def __init__(self, save_callback=None):
         self.new_users: Dict[int, Dict[str, Any]] = {}  # Добавим type hint для ясности
         self.new_users_lock = asyncio.Lock()
-
+        self.save_callback = save_callback
         self.bad_nicknames = []
+
+    def _trigger_save(self):
+        if self.save_callback:
+            asyncio.create_task(self.save_callback())
 
     async def add_user(self, user_id, user_data):
         async with self.new_users_lock:
             self.new_users[user_id] = user_data
+        self._trigger_save()
 
     async def remove_user(self, user_id):
         async with self.new_users_lock:
-            return self.new_users.pop(user_id, None)
+            res = self.new_users.pop(user_id, None)
+        if res is not None:
+            self._trigger_save()
+        return res
 
     async def update_user_text(self, user_id, text, text_id):
         async with self.new_users_lock:
@@ -378,8 +408,14 @@ class UserManager:
         async with self.new_users_lock:
             if user_id in self.new_users:
                 self.new_users[user_id]['clean_messages'] = self.new_users[user_id].get('clean_messages', 0) + 1
-                return self.new_users[user_id]['clean_messages']
-            return 0
+                new_count = self.new_users[user_id]['clean_messages']
+            else:
+                new_count = 0
+                
+        if new_count > 0:
+            self._trigger_save()
+            
+        return new_count
 
     async def add_bad_nickname(self, nickname):
         if nickname not in self.bad_nicknames:
@@ -427,13 +463,18 @@ class UserManager:
 
     async def update_user_status(self, user_id, new_status, restrict_reason=None):
         """Обновляет статус пользователя по его ID и опционально причину ограничения"""
+        updated = False
         async with self.new_users_lock:
             if user_id in self.new_users:
                 self.new_users[user_id]['status'] = new_status
                 if restrict_reason:
                     self.new_users[user_id]['restrict_reason'] = restrict_reason
-                return True
-            return False
+                updated = True
+                
+        if updated:
+            self._trigger_save()
+            
+        return updated
 
         # !!! НОВЫЙ МЕТОД !!!
 
@@ -466,7 +507,7 @@ class TelegramBot:
         self.db_manager = DatabaseManager(dsn)
         # bad_words=await self.db_manager.load_bad_words()
         #
-        self.user_manager = UserManager()
+        self.user_manager = UserManager(save_callback=self.save_user_state)
         self._register_handlers()
 
     async def notify_master(self, text: str, parse_mode: str = None, bot_instance=None, reply_markup=None):
@@ -1118,7 +1159,15 @@ class TelegramBot:
         has_link_preview = getattr(message, 'link_preview_options', None) and getattr(message.link_preview_options, 'url', None)
         has_forward = getattr(message, 'forward_origin', None) is not None
 
-        if entities or has_link_preview or has_forward:
+        filtered_entities = []
+        if entities:
+            for ent in entities:
+                # Разрешаем хэштеги в топиках Объявления (ads) и Посылки (parcels)
+                if ent.type == 'hashtag' and topic_name in ['ads', 'parcels']:
+                    continue
+                filtered_entities.append(ent)
+
+        if filtered_entities or has_link_preview or has_forward:
             reason_str = "Entities/Скрытые ссылки/Форварды"
             if has_link_preview:
                 reason_str = "Скрытая ссылка (Link Preview)"
@@ -1442,6 +1491,14 @@ class TelegramBot:
                 )
             except Exception as e_inner:
                 logging.error(f"Не удалось отправить сообщение об ошибке мастеру: {e_inner}", exc_info=True)
+
+    async def save_user_state(self):
+        """Немедленно сохраняет текущее состояние пользователей в БД"""
+        try:
+            current_users_state = await self.user_manager.get_all_users_data()
+            await self.db_manager.save_users_to_db(current_users_state)
+        except Exception as e:
+            logging.error(f"Ошибка немедленного сохранения состояния: {e}", exc_info=True)
 
     async def send_hourly_report(self):
         """Фоновая задача для очистки старых пользователей и сохранения БД."""
