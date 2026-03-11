@@ -326,7 +326,8 @@ class TextProcessor:
     def count_non_latin_cyrillic(text):
         if not isinstance(text, str):
             return 0
-        return len(re.findall(r'[^a-zA-Zа-яА-ЯёЁ\s.,!?0-9]', text))
+        # Match letters that are NOT in Basic Latin/Latin Ext/Cyrillic to avoid counting emojis and punctuation
+        return len(re.findall(r'[^\W\d_\u0000-\u024F\u0400-\u052F]', text))
     @staticmethod
     def normalize_text_cyr(text):
         # Заменить кириллицу на похожие латинские символы
@@ -1186,6 +1187,8 @@ class TelegramBot:
 
 
 
+        skip_quarantine = topic_name in ['ads', 'parcels']
+
         entities = message.entities or message.caption_entities  # Берём entities текста или подписи
         has_link_preview = getattr(message, 'link_preview_options', None) and getattr(message.link_preview_options, 'url', None)
         has_forward = getattr(message, 'forward_origin', None) is not None
@@ -1198,7 +1201,7 @@ class TelegramBot:
                     continue
                 filtered_entities.append(ent)
 
-        if filtered_entities or has_link_preview or has_forward:
+        if not skip_quarantine and (filtered_entities or has_link_preview or has_forward):
             reason_str = "Entities/Скрытые ссылки/Форварды"
             if has_link_preview:
                 reason_str = "Скрытая ссылка (Link Preview)"
@@ -1240,7 +1243,7 @@ class TelegramBot:
 
         # --- Обработка нового пользователя ---
 
-        if non_latin_cyrillic_count > 5:  # Используйте константу из config
+        if not skip_quarantine and non_latin_cyrillic_count > 5:  # Используйте константу из config
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
                 f"ID: {sender_id}",
@@ -1270,7 +1273,7 @@ class TelegramBot:
             return
 
         usdt_usdc=TextProcessor.contains_usdt_or_usdc(text)
-        if usdt_usdc:
+        if not skip_quarantine and usdt_usdc:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
                 f"ID: {sender_id}",
@@ -1325,7 +1328,7 @@ class TelegramBot:
                 text_repeated = True
                 logging.warning(f"Обнаружено {min_repetition_count} одинаковых сообщения подряд от {sender_id}.")
 
-        if text_repeated:
+        if not skip_quarantine and text_repeated:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
                 f"ID: {sender_id}",
@@ -1365,7 +1368,7 @@ class TelegramBot:
 
             return
         spam_prediction = self.spam_detector.make_spam_prediction(text)
-        if spam_prediction == 1:
+        if not skip_quarantine and spam_prediction == 1:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
                 f"ID: {sender_id}",
