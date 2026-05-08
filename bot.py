@@ -1178,6 +1178,10 @@ class TelegramBot:
 
         sender_id = message.from_user.id
         chat_id = message.chat.id
+        chat_title = message.chat.title or message.chat.full_name or ""
+        chat_username = f" (@{message.chat.username})" if message.chat.username else ""
+        chat_info = f"{chat_title}{chat_username}".strip()
+        chat_display = f"{chat_id} ({chat_info})" if chat_info else str(chat_id)
         text = message.text or ""  # Гарантируем строку
 
         # Получаем данные пользователя (если он отслеживается)
@@ -1202,7 +1206,7 @@ class TelegramBot:
             # await self.bot.send_message(...)
             final_msg_to_master = (
                 f"ID message: {message.message_id}\n"
-                f"ID chat: {chat_id}\n"
+                f"ID chat: {chat_display}\n"
                 f"ID sender: {sender_id}\n"
                 f"User Name: {message.from_user.username}\n"
                 f"Топик: {topic_name}\n"
@@ -1246,7 +1250,7 @@ class TelegramBot:
             # Формирование отчета для админа (добавим флаг повтора)
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
-                f"ID chat: {chat_id}",
+                f"ID chat: {chat_display}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1280,7 +1284,7 @@ class TelegramBot:
         if not skip_quarantine and non_latin_cyrillic_count > 5:  # Используйте константу из config
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
-                f"ID chat: {chat_id}",
+                f"ID chat: {chat_display}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1311,7 +1315,7 @@ class TelegramBot:
         if not skip_quarantine and usdt_usdc:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
-                f"ID chat: {chat_id}",
+                f"ID chat: {chat_display}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1367,7 +1371,7 @@ class TelegramBot:
         if not skip_quarantine and text_repeated:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
-                f"ID chat: {chat_id}",
+                f"ID chat: {chat_display}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1408,7 +1412,7 @@ class TelegramBot:
         if not skip_quarantine and spam_prediction == 1:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
-                f"ID chat: {chat_id}",
+                f"ID chat: {chat_display}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
