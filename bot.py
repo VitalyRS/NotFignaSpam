@@ -548,6 +548,7 @@ class TelegramBot:
         self.router.message(Command(commands=['set_topic']))(self.set_topic)
         self.router.message(Command(commands=['reset_limit']))(self.reset_limit)
         self.router.message(Command(commands=['nolim']))(self.nolim_user)
+        self.router.message(Command(commands=['send']))(self.send_arbitrary_message)
         self.router.chat_member()(self.handle_chat_member)
         self.router.message(F.text)(self.handle_message)
         self.router.message(F.photo | F.video | F.audio | F.document |
@@ -580,6 +581,7 @@ class TelegramBot:
 ⚙️ *Настройка системы:*
 • `/set_topic <тип>` — привязать текущий топик к антиспам-правилам
 • `/nolim <ID>` — снять флуд-контроль в ads и parcels
+• `/send <ID_чата> <текст>` — отправить сообщение в указанный чат
 
 ℹ️ `/help` — показать это сообщение
 
@@ -820,6 +822,36 @@ class TelegramBot:
         except Exception as e:
             logging.error(f"Ошибка при сбросе лимитов: {e}", exc_info=True)
             await message.reply(f"⚠️ Ошибка сброса лимита: {e}")
+
+    async def send_arbitrary_message(self, message: types.Message):
+        """Отправляет произвольное сообщение в указанный чат"""
+        if message.from_user.id != self.master_id:
+            return
+
+        command_parts = message.text.split(maxsplit=2)
+        if len(command_parts) < 3:
+            await message.reply(
+                "Использование: `/send <ID_чата> <текст_сообщения>`\n"
+                "Пример: `/send -1001234567890 Привет, это тестовое сообщение`",
+                parse_mode="Markdown"
+            )
+            return
+
+        try:
+            chat_id = int(command_parts[1].strip())
+        except ValueError:
+            await message.reply("❌ ID чата должен быть числом.")
+            return
+
+        text_to_send = command_parts[2]
+
+        try:
+            await self.bot.send_message(chat_id=chat_id, text=text_to_send)
+            await message.reply(f"✅ Сообщение успешно отправлено в чат `{chat_id}`.", parse_mode="Markdown")
+            logging.info(f"Админ отправил сообщение в чат {chat_id}: {text_to_send[:50]}...")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сообщения в чат {chat_id}: {e}", exc_info=True)
+            await message.reply(f"❌ Ошибка при отправке сообщения: {e}")
 
     async def check_topic_rules(self, message: types.Message) -> bool:
         """Проверяет правила подгрупп для сообщения. Возвращает True, если сообщение было удалено."""
@@ -1170,6 +1202,7 @@ class TelegramBot:
             # await self.bot.send_message(...)
             final_msg_to_master = (
                 f"ID message: {message.message_id}\n"
+                f"ID chat: {chat_id}\n"
                 f"ID sender: {sender_id}\n"
                 f"User Name: {message.from_user.username}\n"
                 f"Топик: {topic_name}\n"
@@ -1213,6 +1246,7 @@ class TelegramBot:
             # Формирование отчета для админа (добавим флаг повтора)
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
+                f"ID chat: {chat_id}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1246,6 +1280,7 @@ class TelegramBot:
         if not skip_quarantine and non_latin_cyrillic_count > 5:  # Используйте константу из config
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
+                f"ID chat: {chat_id}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1276,6 +1311,7 @@ class TelegramBot:
         if not skip_quarantine and usdt_usdc:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
+                f"ID chat: {chat_id}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1331,6 +1367,7 @@ class TelegramBot:
         if not skip_quarantine and text_repeated:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
+                f"ID chat: {chat_id}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
@@ -1371,6 +1408,7 @@ class TelegramBot:
         if not skip_quarantine and spam_prediction == 1:
             msg_to_master_lines = [
                 f"Сообщение от нового пользователя ({str(time_passed).split('.')[0]} после входа):",
+                f"ID chat: {chat_id}",
                 f"ID: {sender_id}",
                 f"Имя: {user_data.get('username', 'N/A')}",
                 f"Хэндл: {user_data.get('user_handle', 'N/A')}",
