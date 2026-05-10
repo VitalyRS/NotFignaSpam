@@ -557,7 +557,8 @@ class TelegramBot:
         self.router.message(F.text)(self.handle_message)
         self.router.message(F.photo | F.video | F.audio | F.document |
                             F.sticker | F.location | F.contact |
-                            F.animation | F.voice | F.video_note)(self.handle_media)
+                            F.animation | F.voice | F.video_note |
+                            F.poll | F.dice | F.game | F.venue)(self.handle_media)
         self.router.callback_query(F.data.startswith('restore:'))(self.handle_restore_callback)
 
         self.dp.startup.register(self.on_startup)
@@ -1260,13 +1261,26 @@ class TelegramBot:
                 await self.user_manager.update_user_status( user_id, new_status)
 
     async def handle_message(self, message: types.Message):
-        sender_id = message.from_user.id
         chat_id = message.chat.id
         chat_title = message.chat.title or message.chat.full_name or ""
         chat_username = f" (@{message.chat.username})" if message.chat.username else ""
         chat_info_str = f"{chat_title}{chat_username}".strip()
         chat_display = f"{chat_id} ({chat_info_str})" if chat_info_str else str(chat_id)
         text = message.text or ""  # Гарантируем строку
+
+        # Защита от анонимных постов канала (from_user может быть None)
+        if not message.from_user:
+            if chat_id != self.target_chat_id and chat_id != self.FORWARD_CHAT_ID and chat_id != self.master_id:
+                try:
+                    await self.bot.send_message(
+                        chat_id=self.FORWARD_CHAT_ID,
+                        text=f"📨 Анонимный пост из чата:\nID чата: {chat_display}\nТекст: {text[:500] or '(пусто)'}"
+                    )
+                except Exception as e:
+                    logging.error(f"Ошибка пересылки анонимного поста в лог-чат: {e}")
+            return
+
+        sender_id = message.from_user.id
 
         # ── Если сообщение НЕ из целевого чата — пересылаем в лог-чат и выходим ──
         if chat_id != self.target_chat_id:
@@ -1593,14 +1607,47 @@ class TelegramBot:
 
 
     async def handle_media(self, message: types.Message):
+        chat_id = message.chat.id
+
+        # ── Если сообщение НЕ из целевого чата — пересылаем в лог-чат и выходим ──
+        if chat_id != self.target_chat_id:
+            if chat_id != self.FORWARD_CHAT_ID and chat_id != self.master_id:
+                try:
+                    chat_title = message.chat.title or message.chat.full_name or ""
+                    chat_username = f" (@{message.chat.username})" if message.chat.username else ""
+                    chat_info_str = f"{chat_title}{chat_username}".strip()
+                    chat_display = f"{chat_id} ({chat_info_str})" if chat_info_str else str(chat_id)
+                    # Защита от анонимных постов канала
+                    if message.from_user:
+                        sender_info = (
+                            f"От: {message.from_user.full_name} "
+                            f"(@{message.from_user.username or '—'}, ID: {message.from_user.id})"
+                        )
+                    else:
+                        sender_info = "От: (анонимный пост канала)"
+                    log_text = (
+                        f"📨 Медиа из другого чата:\n"
+                        f"ID чата: {chat_display}\n"
+                        f"{sender_info}\n"
+                        f"Тип: {message.content_type}"
+                    )
+                    await self.bot.send_message(
+                        chat_id=self.FORWARD_CHAT_ID,
+                        text=log_text
+                    )
+                except Exception as e:
+                    logging.error(f"Ошибка пересылки медиа в лог-чат: {e}")
+            return
+
+        # Проверки топик-правил (только для целевого чата)
         if await self.check_topic_rules(message):
             return
 
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-
-        if chat_id != self.target_chat_id:
+        # Защита от from_user=None (не должно случаться в целевом чате, но на всякий случай)
+        if not message.from_user:
             return
+
+        user_id = message.from_user.id
 
         user_data = None
         is_new_user = False
