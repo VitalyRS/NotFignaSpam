@@ -487,6 +487,9 @@ class TelegramBot:
     # Дефолтное сообщение при выходе из карантина
     DEFAULT_QUARANTINE_EXIT_MSG = "Вы вышли с карантина, вам даны полные права"
 
+    # ID чата, куда пересылаются сообщения из всех прочих чатов (не TARGET)
+    FORWARD_CHAT_ID = -5180070081
+
     def __init__(self):
         self.bot = Bot(token=os.environ.get("TELEGRAM_BOT_TOKEN"))
         self.dp = Dispatcher()
@@ -549,6 +552,7 @@ class TelegramBot:
         self.router.message(Command(commands=['reset_limit']))(self.reset_limit)
         self.router.message(Command(commands=['nolim']))(self.nolim_user)
         self.router.message(Command(commands=['send']))(self.send_arbitrary_message)
+        self.router.message(Command(commands=['chatinfo']))(self.chat_info)
         self.router.chat_member()(self.handle_chat_member)
         self.router.message(F.text)(self.handle_message)
         self.router.message(F.photo | F.video | F.audio | F.document |
@@ -582,10 +586,13 @@ class TelegramBot:
 • `/set_topic <тип>` — привязать текущий топик к антиспам-правилам
 • `/nolim <ID>` — снять флуд-контроль в ads и parcels
 • `/send <ID_чата> <текст>` — отправить сообщение в указанный чат
+• `/chatinfo <ID_чата>` — показать права бота в указанном чате
 
 ℹ️ `/help` — показать это сообщение
 
 ⚙️ *Автоматические проверки:*
+• Спам-проверка только в TARGET\_CHAT (ID: `{self.target_chat_id}`)
+• Сообщения из других чатов → пересылка в лог-чат без действий
 • Карантин 7 дней для новых пользователей
 • Бан при плохом никнейме/имени
 • Удаление медиа от новых пользователей
@@ -822,6 +829,77 @@ class TelegramBot:
         except Exception as e:
             logging.error(f"Ошибка при сбросе лимитов: {e}", exc_info=True)
             await message.reply(f"⚠️ Ошибка сброса лимита: {e}")
+
+    async def chat_info(self, message: types.Message):
+        """Показывает права бота в указанном чате"""
+        if message.from_user.id != self.master_id:
+            return
+
+        command_parts = message.text.split(maxsplit=1)
+        if len(command_parts) < 2 or not command_parts[1].strip():
+            await message.reply(
+                "Использование: `/chatinfo <ID_чата>`\n"
+                "Пример: `/chatinfo -1001234567890`",
+                parse_mode="Markdown"
+            )
+            return
+
+        try:
+            chat_id = int(command_parts[1].strip())
+        except ValueError:
+            await message.reply("❌ ID чата должен быть числом.")
+            return
+
+        try:
+            # Получаем информацию о чате
+            chat = await self.bot.get_chat(chat_id)
+            # Получаем информацию о боте в этом чате
+            bot_user = await self.bot.get_me()
+            member = await self.bot.get_chat_member(chat_id, bot_user.id)
+
+            status = member.status
+            chat_type = chat.type
+            chat_title = chat.title or chat.full_name or str(chat_id)
+
+            lines = [
+                f"🤖 *Права бота в чате:*",
+                f"📛 Чат: `{chat_title}`",
+                f"🆔 ID: `{chat_id}`",
+                f"📂 Тип: `{chat_type}`",
+                f"📌 Статус бота: `{status}`",
+                "",
+            ]
+
+            if hasattr(member, 'can_delete_messages'):
+                # Бот является администратором — показываем права
+                rights = {
+                    "Удалять сообщения": getattr(member, 'can_delete_messages', False),
+                    "Банить участников": getattr(member, 'can_restrict_members', False),
+                    "Закреплять сообщения": getattr(member, 'can_pin_messages', False),
+                    "Менять информацию чата": getattr(member, 'can_change_info', False),
+                    "Приглашать пользователей": getattr(member, 'can_invite_users', False),
+                    "Продвигать участников": getattr(member, 'can_promote_members', False),
+                    "Управлять видеочатом": getattr(member, 'can_manage_video_chats', False),
+                    "Читать сообщения": getattr(member, 'can_read_messages', True),
+                    "Анонимные сообщения": getattr(member, 'is_anonymous', False),
+                    "Является создателем": status == 'creator',
+                }
+                lines.append("🔑 *Права администратора:*")
+                for perm_name, perm_val in rights.items():
+                    icon = "✅" if perm_val else "❌"
+                    lines.append(f"{icon} {perm_name}")
+            else:
+                lines.append(f"ℹ️ Бот не является администратором в этом чате.")
+                lines.append(f"Статус: `{status}`")
+
+            await message.reply("\n".join(lines), parse_mode="Markdown")
+            logging.info(f"Мастер запросил chatinfo для чата {chat_id}")
+
+        except TelegramBadRequest as e:
+            await message.reply(f"❌ Ошибка Telegram: `{e}`", parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка при получении chatinfo для {chat_id}: {e}", exc_info=True)
+            await message.reply(f"❌ Ошибка: {e}")
 
     async def send_arbitrary_message(self, message: types.Message):
         """Отправляет произвольное сообщение в указанный чат"""
@@ -1173,16 +1251,36 @@ class TelegramBot:
                 await self.user_manager.update_user_status( user_id, new_status)
 
     async def handle_message(self, message: types.Message):
-        if await self.check_topic_rules(message):
-            return
-
         sender_id = message.from_user.id
         chat_id = message.chat.id
         chat_title = message.chat.title or message.chat.full_name or ""
         chat_username = f" (@{message.chat.username})" if message.chat.username else ""
-        chat_info = f"{chat_title}{chat_username}".strip()
-        chat_display = f"{chat_id} ({chat_info})" if chat_info else str(chat_id)
+        chat_info_str = f"{chat_title}{chat_username}".strip()
+        chat_display = f"{chat_id} ({chat_info_str})" if chat_info_str else str(chat_id)
         text = message.text or ""  # Гарантируем строку
+
+        # ── Если сообщение НЕ из целевого чата — пересылаем в лог-чат и выходим ──
+        if chat_id != self.target_chat_id:
+            # Не пересылаем сообщения из самого лог-чата и из личных сообщений с мастером
+            if chat_id != self.FORWARD_CHAT_ID and chat_id != self.master_id:
+                try:
+                    log_text = (
+                        f"📨 Сообщение из другого чата:\n"
+                        f"ID чата: {chat_display}\n"
+                        f"От: {message.from_user.full_name} "
+                        f"(@{message.from_user.username or '—'}, ID: {sender_id})\n"
+                        f"Текст: {text[:500] or '(пусто)'}"
+                    )
+                    await self.bot.send_message(
+                        chat_id=self.FORWARD_CHAT_ID,
+                        text=log_text
+                    )
+                except Exception as e:
+                    logging.error(f"Ошибка пересылки сообщения в лог-чат: {e}")
+            return  # Больше ничего не делаем
+
+        if await self.check_topic_rules(message):
+            return
 
         # Получаем данные пользователя (если он отслеживается)
         user_data = None
