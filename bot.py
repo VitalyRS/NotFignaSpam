@@ -870,24 +870,33 @@ class TelegramBot:
                 "",
             ]
 
-            if hasattr(member, 'can_delete_messages'):
-                # Бот является администратором — показываем права
+            if hasattr(member, 'can_delete_messages') or status == 'creator':
+                # Бот является администратором или создателем — показываем права
+                is_admin = status in ['administrator', 'creator']
                 rights = {
-                    "Удалять сообщения": getattr(member, 'can_delete_messages', False),
-                    "Банить участников": getattr(member, 'can_restrict_members', False),
-                    "Закреплять сообщения": getattr(member, 'can_pin_messages', False),
-                    "Менять информацию чата": getattr(member, 'can_change_info', False),
-                    "Приглашать пользователей": getattr(member, 'can_invite_users', False),
+                    "Отправка сообщений": True, # Админы в группах всегда могут писать
+                    "Удалять сообщения": getattr(member, 'can_delete_messages', is_admin),
+                    "Банить участников": getattr(member, 'can_restrict_members', is_admin),
+                    "Закреплять сообщения": getattr(member, 'can_pin_messages', is_admin),
+                    "Менять информацию": getattr(member, 'can_change_info', is_admin),
+                    "Приглашать пользователей": getattr(member, 'can_invite_users', is_admin),
                     "Продвигать участников": getattr(member, 'can_promote_members', False),
-                    "Управлять видеочатом": getattr(member, 'can_manage_video_chats', False),
+                    "Управлять видеочатом": getattr(member, 'can_manage_video_chats', is_admin),
                     "Читать сообщения": getattr(member, 'can_read_messages', True),
-                    "Анонимные сообщения": getattr(member, 'is_anonymous', False),
-                    "Является создателем": status == 'creator',
                 }
+                
+                # Специфические права для каналов
+                if chat_type == 'channel':
+                    rights["Публикация (каналы)"] = getattr(member, 'can_post_messages', False)
+                    rights["Редактирование (каналы)"] = getattr(member, 'can_edit_messages', False)
+
                 lines.append("🔑 *Права администратора:*")
                 for perm_name, perm_val in rights.items():
                     icon = "✅" if perm_val else "❌"
                     lines.append(f"{icon} {perm_name}")
+                
+                if status == 'creator':
+                    lines.append("\n👑 *Вы являетесь создателем этого чата*")
             else:
                 lines.append(f"ℹ️ Бот не является администратором в этом чате.")
                 lines.append(f"Статус: `{status}`")
