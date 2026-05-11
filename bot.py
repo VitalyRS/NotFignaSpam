@@ -1274,7 +1274,12 @@ class TelegramBot:
                 try:
                     await self.bot.send_message(
                         chat_id=self.FORWARD_CHAT_ID,
-                        text=f"📨 Анонимный пост из чата:\nID чата: {chat_display}\nТекст: {text[:500] or '(пусто)'}"
+                        text=f"📨 Анонимный пост из чата:\nID чата: {chat_display}"
+                    )
+                    await self.bot.forward_message(
+                        chat_id=self.FORWARD_CHAT_ID,
+                        from_chat_id=chat_id,
+                        message_id=message.message_id
                     )
                 except Exception as e:
                     logging.error(f"Ошибка пересылки анонимного поста в лог-чат: {e}")
@@ -1291,12 +1296,17 @@ class TelegramBot:
                         f"📨 Сообщение из другого чата:\n"
                         f"ID чата: {chat_display}\n"
                         f"От: {message.from_user.full_name} "
-                        f"(@{message.from_user.username or '—'}, ID: {sender_id})\n"
-                        f"Текст: {text[:500] or '(пусто)'}"
+                        f"(@{message.from_user.username or '—'}, ID: {sender_id})"
                     )
                     await self.bot.send_message(
                         chat_id=self.FORWARD_CHAT_ID,
                         text=log_text
+                    )
+                    # Пересылаем само сообщение целиком (с форматированием, ссылками и т.д.)
+                    await self.bot.forward_message(
+                        chat_id=self.FORWARD_CHAT_ID,
+                        from_chat_id=chat_id,
+                        message_id=message.message_id
                     )
                 except Exception as e:
                     logging.error(f"Ошибка пересылки сообщения в лог-чат: {e}")
@@ -1620,7 +1630,7 @@ class TelegramBot:
                     # Защита от анонимных постов канала
                     if message.from_user:
                         sender_info = (
-                            f"От: {message.from_user.full_name} "
+                            f"От: \u2764\ufe0f {message.from_user.full_name} "
                             f"(@{message.from_user.username or '—'}, ID: {message.from_user.id})"
                         )
                     else:
@@ -1634,6 +1644,12 @@ class TelegramBot:
                     await self.bot.send_message(
                         chat_id=self.FORWARD_CHAT_ID,
                         text=log_text
+                    )
+                    # Пересылаем само медиа-сообщение (аудио, видео, войс, стикер и т.д.)
+                    await self.bot.forward_message(
+                        chat_id=self.FORWARD_CHAT_ID,
+                        from_chat_id=chat_id,
+                        message_id=message.message_id
                     )
                 except Exception as e:
                     logging.error(f"Ошибка пересылки медиа в лог-чат: {e}")
