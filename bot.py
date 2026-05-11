@@ -1292,11 +1292,23 @@ class TelegramBot:
             # Не пересылаем сообщения из самого лог-чата и из личных сообщений с мастером
             if chat_id != self.FORWARD_CHAT_ID and chat_id != self.master_id:
                 try:
+                    # Если сообщение является ответом — добавляем контекст reply
+                    reply_context = ""
+                    if message.reply_to_message:
+                        r = message.reply_to_message
+                        r_sender = ""
+                        if r.from_user:
+                            r_sender = f"{r.from_user.full_name} (@{r.from_user.username or r.from_user.id})"
+                        elif r.sender_chat:
+                            r_sender = r.sender_chat.title or str(r.sender_chat.id)
+                        r_text = r.text or r.caption or f"[{r.content_type}]"
+                        reply_context = f"\n📎 Отвечал на ({r_sender}): {r_text[:200]}"
                     log_text = (
                         f"📨 Сообщение из другого чата:\n"
                         f"ID чата: {chat_display}\n"
                         f"От: {message.from_user.full_name} "
                         f"(@{message.from_user.username or '—'}, ID: {sender_id})"
+                        f"{reply_context}"
                     )
                     await self.bot.send_message(
                         chat_id=self.FORWARD_CHAT_ID,
@@ -1635,11 +1647,23 @@ class TelegramBot:
                         )
                     else:
                         sender_info = "От: (анонимный пост канала)"
+                    # Если сообщение является ответом — добавляем контекст reply
+                    reply_context = ""
+                    if message.reply_to_message:
+                        r = message.reply_to_message
+                        r_sender = ""
+                        if r.from_user:
+                            r_sender = f"{r.from_user.full_name} (@{r.from_user.username or r.from_user.id})"
+                        elif r.sender_chat:
+                            r_sender = r.sender_chat.title or str(r.sender_chat.id)
+                        r_text = r.text or r.caption or f"[{r.content_type}]"
+                        reply_context = f"\n📎 Отвечал на ({r_sender}): {r_text[:200]}"
                     log_text = (
                         f"📨 Медиа из другого чата:\n"
                         f"ID чата: {chat_display}\n"
                         f"{sender_info}\n"
                         f"Тип: {message.content_type}"
+                        f"{reply_context}"
                     )
                     await self.bot.send_message(
                         chat_id=self.FORWARD_CHAT_ID,
