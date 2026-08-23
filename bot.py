@@ -2,6 +2,7 @@ import joblib
 import html
 from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 import re
@@ -95,6 +96,14 @@ class DatabaseManager:
                     END IF;
                 END $$;
             ''')
+            # Таблица для пользователей/каналов без ограничений (/no_filter)
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS no_filter_users (
+                    identifier TEXT PRIMARY KEY,
+                    added_by BIGINT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            ''')
         finally:
             await conn.close()
 
@@ -176,6 +185,37 @@ class DatabaseManager:
                 FROM topic_limits 
                 ORDER BY last_msg_time DESC
             ''')
+            return [dict(row) for row in rows]
+        finally:
+            await conn.close()
+
+    async def add_no_filter(self, identifier: str, added_by: int) -> bool:
+        """Добавляет ID или username в белый список без ограничений"""
+        conn = await self._connect()
+        try:
+            await conn.execute('''
+                INSERT INTO no_filter_users (identifier, added_by, created_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (identifier) DO NOTHING
+            ''', identifier, added_by)
+            return True
+        finally:
+            await conn.close()
+
+    async def remove_no_filter(self, identifier: str) -> bool:
+        """Удаляет ID или username из белого списка без ограничений"""
+        conn = await self._connect()
+        try:
+            res = await conn.execute('DELETE FROM no_filter_users WHERE identifier = $1', identifier)
+            return res != "DELETE 0"
+        finally:
+            await conn.close()
+
+    async def get_all_no_filter(self) -> list:
+        """Возвращает всех пользователей и каналы из белого списка без ограничений"""
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch('SELECT identifier, added_by, created_at FROM no_filter_users ORDER BY created_at ASC')
             return [dict(row) for row in rows]
         finally:
             await conn.close()
@@ -487,6 +527,14 @@ class TelegramBot:
     # Дефолтное сообщение при выходе из карантина
     DEFAULT_QUARANTINE_EXIT_MSG = "Вы вышли с карантина, вам даны полные права"
 
+    # Предупреждение Дяди Стёпы при нарушении карантина
+    QUARANTINE_WARNING_MSG = (
+        "👮‍♂️ *Дядя Стёпа предупреждает:*\n"
+        "Вы находитесь на карантине, поэтому медиафайлы, ссылки и другие ограниченные сообщения запрещены.\n\n"
+        "⏳ Карантин длится *7 дней*.\n"
+        "✨ Досрочно выйти можно, если вы напишете *2 разных осмысленных текстовых сообщения* в чат."
+    )
+
     # ID чата, куда пересылаются сообщения из всех прочих чатов (не TARGET)
     FORWARD_CHAT_ID = -5180070081
 
@@ -505,6 +553,7 @@ class TelegramBot:
 
         # Кастомное сообщение при выходе из карантина (загружается из БД)
         self.quarantine_exit_msg = self.DEFAULT_QUARANTINE_EXIT_MSG
+        self.no_filter_set = set()
 
         self.spam_detector = SpamDetector()
         dsn=os.environ.get("DSN")
@@ -528,7 +577,6 @@ class TelegramBot:
         try:
             await bot_to_use.send_message(**kwargs)
         except Exception as e:
-            import logging
             logging.error(f"Ошибка отправки сообщения мастеру: {e}")
 
     async def delete_message_delayed(self, chat_id: int, message_id: int, delay_seconds: int):
@@ -538,6 +586,34 @@ class TelegramBot:
             await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception as e:
             logging.error(f"Ошибка при удалении временного сообщения: {e}")
+
+    async def send_quarantine_warning(self, chat_id: int, reply_to_message_id: int = None):
+        """Отправляет предупреждение Дяди Стёпы в чат и удаляет его через 30 секунд."""
+        try:
+            kwargs = {
+                "chat_id": chat_id,
+                "text": self.QUARANTINE_WARNING_MSG,
+                "parse_mode": "Markdown"
+            }
+            if reply_to_message_id:
+                kwargs["reply_to_message_id"] = reply_to_message_id
+            warn_msg = await self.bot.send_message(**kwargs)
+            asyncio.create_task(self.delete_message_delayed(chat_id, warn_msg.message_id, 30))
+        except Exception as e:
+            logging.error(f"Ошибка отправки предупреждения карантина: {e}")
+
+    def is_user_no_filter(self, user_id: int = None, username: str = None, sender_chat=None) -> bool:
+        """Проверяет, находится ли пользователь или канал в белом списке /no_filter."""
+        if user_id and str(user_id) in self.no_filter_set:
+            return True
+        if username and username.lower().lstrip('@') in self.no_filter_set:
+            return True
+        if sender_chat:
+            if sender_chat.id and str(sender_chat.id) in self.no_filter_set:
+                return True
+            if sender_chat.username and sender_chat.username.lower().lstrip('@') in self.no_filter_set:
+                return True
+        return False
 
     def _register_handlers(self):
         self.router.message(Command(commands=['help']))(self.show_help)
@@ -551,6 +627,9 @@ class TelegramBot:
         self.router.message(Command(commands=['set_topic']))(self.set_topic)
         self.router.message(Command(commands=['reset_limit']))(self.reset_limit)
         self.router.message(Command(commands=['nolim']))(self.nolim_user)
+        self.router.message(Command(commands=['no_filter']))(self.no_filter_cmd)
+        self.router.message(Command(commands=['no_filter_del']))(self.no_filter_del_cmd)
+        self.router.message(Command(commands=['no_filter_list']))(self.no_filter_list_cmd)
         self.router.message(Command(commands=['send']))(self.send_arbitrary_message)
         self.router.message(Command(commands=['chatinfo']))(self.chat_info)
         self.router.chat_member()(self.handle_chat_member)
@@ -569,7 +648,7 @@ class TelegramBot:
         if message.from_user.id != self.master_id:
             return
 
-        help_text = f"""
+        help_text = rf"""
 🤖 *Команды бота Anti-Spam:*
 
 📋 *Управление карантином:*
@@ -582,6 +661,11 @@ class TelegramBot:
 • `/suka <никнейм>` — добавить никнейм в чёрный список
 • `/sukan <никнейм>` — удалить никнейм из чёрного списка
 • `/list` — показать список запрещённых никнеймов
+
+🔓 *Белый список без ограничений:*
+• `/no_filter <ID/@username>` — разрешить писать без фильтров, тегов и спам-проверок
+• `/no_filter_del <ID/@username>` — удалить из списка без ограничений
+• `/no_filter_list` — показать список исключений без ограничений
 
 ⚙️ *Настройка системы:*
 • `/set_topic <тип>` — привязать текущий топик к антиспам-правилам
@@ -665,7 +749,7 @@ class TelegramBot:
             await message.reply(f"❌ Ошибка: {e}")
 
     async def handle_restore_callback(self, callback: types.CallbackQuery):
-        """Обрабатывает нажатие на кнопку 'Восстановить' от администратора."""
+        """Обрабатывает нажатие на кнопку 'Разблокировать и снять с карантина' от администратора."""
         if callback.from_user.id != self.master_id:
             await callback.answer("У вас нет прав!", show_alert=True)
             return
@@ -700,15 +784,15 @@ class TelegramBot:
             
             # Изменяем сообщение у администратора, убирая кнопку
             original_text = callback.message.text or callback.message.caption or "Сообщение"
-            new_text = original_text + "\n\n✅ *РЕШЕНО: Пользователь восстановлен.*"
+            new_text = original_text + "\n\n✅ *РЕШЕНО: Пользователь разблокирован, права возвращены, снят с карантина.*"
             try:
                 await callback.message.edit_text(new_text, parse_mode="Markdown")
             except Exception as e:
                 # Если парс мод не сработал из-за старого текста
-                await callback.message.edit_text(original_text + "\n\n✅ РЕШЕНО: Пользователь восстановлен.")
+                await callback.message.edit_text(original_text + "\n\n✅ РЕШЕНО: Пользователь разблокирован, права возвращены, снят с карантина.")
                 
-            await callback.answer("Пользователь успешно восстановлен!")
-            logging.info(f"Админ {callback.from_user.id} восстановил пользователя {user_id} через inline кнопку.")
+            await callback.answer("Пользователь разблокирован и снят с карантина!")
+            logging.info(f"Админ {callback.from_user.id} разблокировал и снял с карантина пользователя {user_id} через inline кнопку.")
             
         except Exception as e:
             logging.error(f"Ошибка при инлайн восстановлении пользователя {user_id}: {e}", exc_info=True)
@@ -831,6 +915,76 @@ class TelegramBot:
             logging.error(f"Ошибка при сбросе лимитов: {e}", exc_info=True)
             await message.reply(f"⚠️ Ошибка сброса лимита: {e}")
 
+    async def no_filter_cmd(self, message: types.Message):
+        """Добавляет пользователя или канал в белый список без каких-либо ограничений и проверок"""
+        if message.from_user.id != self.master_id:
+            return
+
+        command_parts = message.text.split(maxsplit=1)
+        if len(command_parts) < 2 or not command_parts[1].strip():
+            await message.reply(
+                "Использование: `/no_filter <ID_пользователя | @username | username_канала>`\n"
+                "Пример: `/no_filter 123456789` или `/no_filter @my_channel`",
+                parse_mode="Markdown"
+            )
+            return
+
+        identifier = command_parts[1].strip().lstrip('@').lower()
+        try:
+            await self.db_manager.add_no_filter(identifier, message.from_user.id)
+            self.no_filter_set.add(identifier)
+            await message.reply(f"✅ `{identifier}` добавлен в список `/no_filter` (полный доступ без ограничений, тегов и спам-фильтра).", parse_mode="Markdown")
+            logging.info(f"Мастер {message.from_user.id} добавил '{identifier}' в no_filter")
+        except Exception as e:
+            logging.error(f"Ошибка при добавлении в no_filter: {e}", exc_info=True)
+            await message.reply(f"❌ Ошибка: {e}")
+
+    async def no_filter_del_cmd(self, message: types.Message):
+        """Удаляет пользователя или канал из белого списка без ограничений"""
+        if message.from_user.id != self.master_id:
+            return
+
+        command_parts = message.text.split(maxsplit=1)
+        if len(command_parts) < 2 or not command_parts[1].strip():
+            await message.reply(
+                "Использование: `/no_filter_del <ID_пользователя | @username>`",
+                parse_mode="Markdown"
+            )
+            return
+
+        identifier = command_parts[1].strip().lstrip('@').lower()
+        try:
+            removed = await self.db_manager.remove_no_filter(identifier)
+            self.no_filter_set.discard(identifier)
+            if removed:
+                await message.reply(f"✅ `{identifier}` удален из списка `/no_filter`.", parse_mode="Markdown")
+                logging.info(f"Мастер {message.from_user.id} удалил '{identifier}' из no_filter")
+            else:
+                await message.reply(f"⚠️ `{identifier}` не найден в списке `/no_filter`.", parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка при удалении из no_filter: {e}", exc_info=True)
+            await message.reply(f"❌ Ошибка: {e}")
+
+    async def no_filter_list_cmd(self, message: types.Message):
+        """Показывает список пользователей и каналов без ограничений"""
+        if message.from_user.id != self.master_id:
+            return
+
+        try:
+            records = await self.db_manager.get_all_no_filter()
+            if not records:
+                await message.reply("Список `/no_filter` пуст.", parse_mode="Markdown")
+                return
+
+            lines = ["📋 *Пользователи и каналы без ограничений (`/no_filter`):*"]
+            for r in records:
+                date_str = r['created_at'].strftime('%Y-%m-%d %H:%M') if r.get('created_at') else 'N/A'
+                lines.append(f"• `{r['identifier']}` (добавлен: {date_str})")
+            await message.reply("\n".join(lines), parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка при получении списка no_filter: {e}", exc_info=True)
+            await message.reply(f"❌ Ошибка: {e}")
+
     async def chat_info(self, message: types.Message):
         """Показывает права бота в указанном чате"""
         if message.from_user.id != self.master_id:
@@ -946,8 +1100,9 @@ class TelegramBot:
         if message.chat.id != self.target_chat_id:
             return False
 
-        user_id = message.from_user.id
-        if user_id == self.master_id:
+        user_id = message.from_user.id if message.from_user else None
+        username = message.from_user.username if message.from_user else None
+        if user_id == self.master_id or self.is_user_no_filter(user_id, username, message.sender_chat):
             return False
             
         thread_id = message.message_thread_id
@@ -976,24 +1131,27 @@ class TelegramBot:
                 if message.video_note or message.voice:
                     await message.delete()
                     return True
-                
-                # Tag validation 
+
+                # Фото/видео без подписи в составе альбома — пропускаем полностью.
+                # Тег и флуд-контроль уже сработают на фото с подписью (первом сообщении альбома).
+                # Без этого check_topic_limit срабатывает на каждое фото альбома и банит за флуд.
+                if message.media_group_id and not msg_tags:
+                    return False
+
+                # Tag validation
                 tags = ['#ищу', '#передам', '#еду', '#куда', '#из', '#возьму']
                 if not any(tag in msg_tags for tag in tags):
-                    if message.media_group_id and not msg_tags:
-                        pass # Skip empty caption elements in media group
-                    else:
-                        warn_msg = await message.reply(
-                             f"⚠️ Привет, {message.from_user.first_name}! В топике «Посылки» обязательно использование хотя бы одного из тегов: "
-                             f"`" + "`, `".join(tags) + "`.\n\n"
-                             f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
-                             parse_mode="Markdown"
-                        )
-                        await message.delete()
-                        asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
-                        return True
-                
-                # Flood control 72h
+                    warn_msg = await message.reply(
+                         f"⚠️ Привет, {message.from_user.first_name}! В топике «Посылки» обязательно использование хотя бы одного из тегов: "
+                         f"`" + "`, `".join(tags) + "`.\n\n"
+                         f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
+                         parse_mode="Markdown"
+                    )
+                    await message.delete()
+                    asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
+                    return True
+
+                # Flood control 72h (только для основного сообщения с тегом/подписью)
                 if not await self.db_manager.check_topic_limit(user_id, topic_type, 72, message.from_user.first_name, message.from_user.username):
                     warn_msg = await message.reply(
                          f"⏳ Привет, {message.from_user.first_name}! В топике «Посылки» можно писать не чаще 1 раза в 72 часа.\n\n"
@@ -1005,22 +1163,24 @@ class TelegramBot:
                     return True
 
             if topic_type == 'ads':
+                # Фото/видео без подписи в составе альбома — пропускаем полностью.
+                # Тег и флуд-контроль уже сработают на фото с подписью (первом сообщении альбома).
+                if message.media_group_id and not msg_tags:
+                    return False
+
                 tags = ['#услуги', '#работа', '#квартира']
                 if not any(tag in msg_tags for tag in tags):
-                    if message.media_group_id and not msg_tags:
-                        pass # Skip empty caption elements in media group
-                    else:
-                        warn_msg = await message.reply(
-                             f"⚠️ Привет, {message.from_user.first_name}! В топике «Объявления» обязательно использование хотя бы одного из тегов: "
-                             f"`" + "`, `".join(tags) + "`.\n\n"
-                             f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
-                             parse_mode="Markdown"
-                        )
-                        await message.delete()
-                        asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
-                        return True
-                
-                # Flood control 24h
+                    warn_msg = await message.reply(
+                         f"⚠️ Привет, {message.from_user.first_name}! В топике «Объявления» обязательно использование хотя бы одного из тегов: "
+                         f"`" + "`, `".join(tags) + "`.\n\n"
+                         f"Ваше сообщение было удалено. Пожалуйста, добавьте тег и отправьте снова.",
+                         parse_mode="Markdown"
+                    )
+                    await message.delete()
+                    asyncio.create_task(self.delete_message_delayed(warn_msg.chat.id, warn_msg.message_id, 30))
+                    return True
+
+                # Flood control 24h (только для основного сообщения с тегом/подписью)
                 if not await self.db_manager.check_topic_limit(user_id, topic_type, 24, message.from_user.first_name, message.from_user.username):
                     warn_msg = await message.reply(
                          f"⏳ Привет, {message.from_user.first_name}! В топике «Объявления» можно писать не чаще 1 раза в 24 часа.\n\n"
@@ -1231,12 +1391,6 @@ class TelegramBot:
                     'clean_messages': 0  # Счётчик чистых сообщений для раннего выхода из карантина
                 })
                 logging.info(f"Новый участник {username} ({user_id}) добавлен в список отслеживания.")
-                try:
-                    await self.notify_master(
-                        f"Новый участник в целевом чате:\nИмя: {username}\nХэндл: {user_handle}\nID: {user_id}"
-                    )
-                except Exception as e:
-                    logging.error(f"Ошибка отправки мастеру уведомления о новом участнике: {e}", exc_info=True)
 
                 name_to_check = user.username or ""
                 full_name_to_check = username
@@ -1286,6 +1440,11 @@ class TelegramBot:
             return
 
         sender_id = message.from_user.id
+        username = message.from_user.username
+
+        # Если пользователь/канал в белом списке /no_filter — пропускаем без ограничений
+        if self.is_user_no_filter(sender_id, username, message.sender_chat):
+            return
 
         # ── Если сообщение НЕ из целевого чата — пересылаем в лог-чат и выходим ──
         if chat_id != self.target_chat_id:
@@ -1341,31 +1500,16 @@ class TelegramBot:
             if topic_type:
                 topic_name = topic_type
 
-        # Если пользователя нет в словаре новых, обрабатываем как старого
+        # Если пользователя нет в словаре новых — это обычный участник чата, пропускаем
         if not user_data:
-            logging.debug(f"Сообщение от неотслеживаемого пользователя {sender_id}")
-            # Ваш код для обработки старых пользователей (например, пересылка админу)
-            # final_msg_to_master = ...
-            # await self.bot.send_message(...)
-            final_msg_to_master = (
-                f"ID message: {message.message_id}\n"
-                f"ID chat: {chat_display}\n"
-                f"ID sender: {sender_id}\n"
-                f"User Name: {message.from_user.username}\n"
-                f"Топик: {topic_name}\n"
-                f"Текст:\n```\n{text}\n```\n"
-            )
-            final_msg_to_master = TextProcessor.fix_markdown(final_msg_to_master)
-            await self.notify_master( final_msg_to_master, parse_mode="Markdown")
-            return  # Прекращаем обработку здесь
+            logging.debug(f"Сообщение от обычного (не карантинного) пользователя {sender_id}, пропускаем")
+            return  # Прекращаем обработку, никаких уведомлений мастеру
 
         # Сколько времени прошло после присоеденения юзера
         time_joined = user_data.get("join_time", datetime.now(timezone.utc))
         if time_joined.tzinfo is None:  # Убедимся что есть таймзона
             time_joined = time_joined.replace(tzinfo=timezone.utc)
         time_passed = datetime.now(timezone.utc) - time_joined
-
-
 
         skip_quarantine = topic_name in ['ads', 'parcels']
 
@@ -1402,6 +1546,8 @@ class TelegramBot:
                 reason_str
             ]
             await message.delete()
+            # Отправляем предупреждение Дяди Стёпы в чат с автоудалением через 30 секунд
+            await self.send_quarantine_warning(chat_id)
             permissions = types.ChatPermissions(can_send_messages=False)
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: {reason_str}")
@@ -1411,9 +1557,8 @@ class TelegramBot:
             final_msg_to_master = "\n".join(msg_to_master_lines)
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
             formatted_report = TextProcessor.fix_markdown(final_msg_to_master)
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-               InlineKeyboardButton(text="✅ Восстановить (Не спам)", callback_data=f"restore:{sender_id}")
+               InlineKeyboardButton(text="✅ Разблокировать и снять с карантина", callback_data=f"restore:{sender_id}")
             ]])
             await self.notify_master(formatted_report, parse_mode="Markdown", reply_markup=kb)
 
@@ -1436,6 +1581,8 @@ class TelegramBot:
                 f"Non-latin/cyrillic symbols detected"
             ]
             await message.delete()
+            # Отправляем предупреждение Дяди Стёпы в чат с автоудалением через 30 секунд
+            await self.send_quarantine_warning(chat_id)
             permissions = types.ChatPermissions(can_send_messages=False)
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: non-latin/cyrillic symbols")
@@ -1446,9 +1593,8 @@ class TelegramBot:
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
             formatted_report = TextProcessor.fix_markdown(final_msg_to_master)
             
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-               InlineKeyboardButton(text="✅ Восстановить (Не спам)", callback_data=f"restore:{sender_id}")
+               InlineKeyboardButton(text="✅ Разблокировать и снять с карантина", callback_data=f"restore:{sender_id}")
             ]])
             await self.notify_master(formatted_report, parse_mode="Markdown", reply_markup=kb)
 
@@ -1467,6 +1613,8 @@ class TelegramBot:
                 f"USDT/ USDC"
             ]
             await message.delete()
+            # Отправляем предупреждение Дяди Стёпы в чат с автоудалением через 30 секунд
+            await self.send_quarantine_warning(chat_id)
             permissions = types.ChatPermissions(can_send_messages=False)
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: usdt usdc")
@@ -1477,9 +1625,8 @@ class TelegramBot:
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
             formatted_report = TextProcessor.fix_markdown(final_msg_to_master)
             
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-               InlineKeyboardButton(text="✅ Восстановить (Не спам)", callback_data=f"restore:{sender_id}")
+               InlineKeyboardButton(text="✅ Разблокировать и снять с карантина", callback_data=f"restore:{sender_id}")
             ]])
             await self.notify_master(formatted_report, parse_mode="Markdown", reply_markup=kb)
 
@@ -1494,18 +1641,10 @@ class TelegramBot:
         messages_history = user_data.get('text', [])
         message_ids_history = user_data.get('text_id', [])
 
-        # print("user_data", user_data)
-        # print("text:", text)
-        # print("messages_history:", messages_history)
-#
         # Проверяем, если накопилось достаточно сообщений для проверки + текущее
         if len(messages_history) >= min_repetition_count - 1:
             # Берем последние N-1 сообщений из истории и добавляем текущее
             recent_messages_to_check = messages_history[-(min_repetition_count - 1):] + [text]
-            # print("user_data",user_data)
-            # print("text:",text)
-            # print("messages_history:", messages_history)
-            # recent_messages_to_check = messages_history[-(min_repetition_count - 1):] + [text]
             # Если все сообщения в этом срезе одинаковы
             if len(set(recent_messages_to_check)) == 1:
                 text_repeated = True
@@ -1523,6 +1662,8 @@ class TelegramBot:
             ]
             # Удаляем текущее сообщение
             await message.delete()
+            # Отправляем предупреждение Дяди Стёпы в чат с автоудалением через 30 секунд
+            await self.send_quarantine_warning(chat_id)
             deleted_count = 0
             logging.warning(f"Удаление предыдущих сообщений ({message_ids_history}) от {sender_id} из-за повторов.")
             for msg_id in message_ids_history:
@@ -1544,9 +1685,8 @@ class TelegramBot:
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
             formatted_report = TextProcessor.fix_markdown(final_msg_to_master)
             
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-               InlineKeyboardButton(text="✅ Восстановить (Не спам)", callback_data=f"restore:{sender_id}")
+               InlineKeyboardButton(text="✅ Разблокировать и снять с карантина", callback_data=f"restore:{sender_id}")
             ]])
             await self.notify_master(formatted_report, parse_mode="Markdown", reply_markup=kb)
 
@@ -1564,6 +1704,8 @@ class TelegramBot:
             ]
 
             await message.delete()
+            # Отправляем предупреждение Дяди Стёпы в чат с автоудалением через 30 секунд
+            await self.send_quarantine_warning(chat_id)
             permissions = types.ChatPermissions(can_send_messages=False)
             await self.bot.restrict_chat_member(chat_id, sender_id, permissions=permissions)
             logging.info(f"Пользователь {sender_id} ограничен (только чтение). Причина: SPAM")
@@ -1574,9 +1716,8 @@ class TelegramBot:
             # Экранируем для Markdown (TextProcessor.fix_markdown - ваша функция)
             formatted_report = TextProcessor.fix_markdown(final_msg_to_master)
             
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-               InlineKeyboardButton(text="✅ Восстановить (Не спам)", callback_data=f"restore:{sender_id}")
+               InlineKeyboardButton(text="✅ Разблокировать и снять с карантина", callback_data=f"restore:{sender_id}")
             ]])
             await self.notify_master(formatted_report, parse_mode="Markdown", reply_markup=kb)
             return
@@ -1611,11 +1752,7 @@ class TelegramBot:
                 
                 logging.info(f"Пользователь {sender_id} ({user_data.get('username')}) прошёл проверку (2 чистых сообщения). Полные права восстановлены.")
                 
-                # Отправляем пользователю сообщение о выходе из карантина (реплаем на его сообщение)
-                try:
-                    await message.reply(self.quarantine_exit_msg)
-                except Exception as reply_err:
-                    logging.error(f"Не удалось отправить сообщение о выходе из карантина пользователю {sender_id}: {reply_err}")
+                # Сообщение о выходе из карантина в публичный чат больше не отправляется по требованию задачи
                 
                 await self.notify_master(
                     f"✅ Пользователь прошёл проверку:\n"
@@ -1688,6 +1825,11 @@ class TelegramBot:
             return
 
         user_id = message.from_user.id
+        username = message.from_user.username
+
+        # Если пользователь/канал в белом списке /no_filter — пропускаем
+        if self.is_user_no_filter(user_id, username, message.sender_chat):
+            return
 
         user_data = None
         is_new_user = False
@@ -1714,6 +1856,9 @@ class TelegramBot:
             # Сначала записываем медиа в историю
             await self.user_manager.update_user_text(user_id, "medioFuck", message.message_id)
             await message.delete()
+            
+            # Отправляем предупреждение Дяди Стёпы в чат с автоудалением через 30 секунд
+            await self.send_quarantine_warning(chat_id)
             
             # Получаем обновлённые данные для проверки повторов
             async with self.user_manager.new_users_lock:
@@ -1743,9 +1888,13 @@ class TelegramBot:
                     logging.info(f"Пользователь {user_id} ограничен (только чтение). Причина: 3 медиа подряд")
                     await self.user_manager.update_user_status(user_id, "restricted", "3 медиа подряд")
                     
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="✅ Разблокировать и снять с карантина", callback_data=f"restore:{user_id}")
+                    ]])
                     await self.notify_master(
                         f"🚫 Пользователь {user_data['username']} ({user_id}) заблокирован.\n"
-                        f"Причина: отправил 3 медиа подряд на карантине."
+                        f"Причина: отправил 3 медиа подряд на карантине.",
+                        reply_markup=kb
                     )
                     return
             
@@ -1810,6 +1959,11 @@ class TelegramBot:
             logging.info(log_message)
             self.user_manager.bad_nicknames= await self.db_manager.load_bad_words()
             
+            # Загружаем список no_filter
+            no_filter_records = await self.db_manager.get_all_no_filter()
+            self.no_filter_set = {r['identifier'] for r in no_filter_records}
+            logging.info(f"Загружено {len(self.no_filter_set)} записей no_filter.")
+
             # Загружаем кастомное сообщение выхода из карантина
             custom_exit_msg = await self.db_manager.get_setting('quarantine_exit_msg')
             if custom_exit_msg:
